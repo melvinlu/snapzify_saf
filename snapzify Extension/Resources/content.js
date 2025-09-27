@@ -37,27 +37,41 @@ function getPopupContainer() {
 
 // Helper function to update popup with partial streaming data
 function updatePopupWithPartialData(partialData) {
-    if (!state.currentPopup) return;
+    if (!state.currentPopup) {
+        console.log('🌊 No popup to update');
+        return;
+    }
 
     const chineseTextDiv = state.currentPopup.querySelector('#chinese-text');
-    if (!chineseTextDiv || !partialData.characters) return;
+    if (!chineseTextDiv || !partialData.characters) {
+        console.log('🌊 Missing elements:', !!chineseTextDiv, !!partialData.characters);
+        return;
+    }
 
     // Update pinyin as it arrives
     const charDivs = chineseTextDiv.querySelectorAll('[data-char]');
+    console.log('🌊 Updating', partialData.characters.length, 'characters, found', charDivs.length, 'divs');
+
+    let updatedCount = 0;
     partialData.characters.forEach((charData, index) => {
         if (charDivs[index] && charData.pinyin) {
-            const pinyinSpan = charDivs[index].querySelector('.pinyin-label');
+            // The pinyin label is a sibling of the character div, not a child
+            const charColumn = charDivs[index].parentElement;
+            const pinyinSpan = charColumn ? charColumn.querySelector('.pinyin-label') : null;
             if (pinyinSpan) {
                 pinyinSpan.textContent = charData.pinyin;
+                updatedCount++;
             }
         }
     });
+    console.log('🌊 Updated', updatedCount, 'pinyin labels');
 
     // Update meaning if available
     if (partialData.meaning) {
         const meaningDiv = state.currentPopup.querySelector('#chinese-meaning');
         if (meaningDiv) {
             meaningDiv.textContent = partialData.meaning;
+            console.log('🌊 Updated meaning');
         }
     }
 }
@@ -201,6 +215,7 @@ MAINTAIN EXACT CHARACTER ORDER!`
 
                                         // Update UI with partial data
                                         if (tempParsed.characters && tempParsed.characters.length > 0) {
+                                            console.log('🌊 Streaming update:', tempParsed.characters.length, 'characters parsed');
                                             updatePopupWithPartialData(tempParsed);
                                         }
                                     } catch (e) {
@@ -926,6 +941,7 @@ function createSubtitlePopup(text) {
 
     // Create character grid with pinyin - stable layout
     const chineseTextContainer = document.createElement('div');
+    chineseTextContainer.id = 'chinese-text';  // Add ID for streaming updates
     chineseTextContainer.style.cssText = `
         display: flex;
         justify-content: center;
@@ -995,6 +1011,7 @@ function createSubtitlePopup(text) {
 
             // Always create pinyin div for stable layout, but only populate if we have data
             const pinyinDiv = document.createElement('div');
+            pinyinDiv.className = 'pinyin-label';  // Add class for streaming updates
             pinyinDiv.style.cssText = `
                 font-size: 11px;
                 color: rgba(255, 255, 255, 0.7);
@@ -1083,7 +1100,7 @@ function createSubtitlePopup(text) {
                 text-align: center;
             `;
             meaningDiv.textContent = state.chatgptBreakdown.meaning;
-            meaningDiv.id = 'meaning-section';
+            meaningDiv.id = 'chinese-meaning';  // Changed to match streaming update function
             breakdownContainer.appendChild(meaningDiv);
         }
     } else {
@@ -1096,7 +1113,7 @@ function createSubtitlePopup(text) {
             font-style: italic;
         `;
         loadingDiv.textContent = 'Processing...';
-        loadingDiv.id = 'meaning-section';
+        loadingDiv.id = 'chinese-meaning';  // Changed to match streaming update function
         breakdownContainer.appendChild(loadingDiv);
     }
 
@@ -1384,7 +1401,12 @@ function setupVideoMonitoring() {
         if (video.paused) {
             checkForChineseSubtitles();
             if (state.currentSubtitleText && !state.isPopupOpen) {
-                createSubtitlePopup(state.currentSubtitleText);
+                // Use the same processing flow as pause handler
+                if (state.openaiKey) {
+                    processSubtitleWithChatGPT(state.currentSubtitleText);
+                } else {
+                    createSubtitlePopup(state.currentSubtitleText);
+                }
             }
         }
     };
@@ -1400,10 +1422,16 @@ function setupSubtitleMonitoring() {
     const observer = new MutationObserver(() => {
         checkForChineseSubtitles();
 
-        // If video is paused and we have new Chinese text, show popup
+        // If video is paused and we have new Chinese text, process it (don't create popup directly)
         const video = document.querySelector('video');
         if (video && video.paused && state.currentSubtitleText && !state.isPopupOpen) {
-            createSubtitlePopup(state.currentSubtitleText);
+            // Let processSubtitleWithChatGPT handle popup creation and ChatGPT processing
+            if (state.openaiKey) {
+                processSubtitleWithChatGPT(state.currentSubtitleText);
+            } else {
+                // Only create popup directly if no API key (for key input)
+                createSubtitlePopup(state.currentSubtitleText);
+            }
         }
     });
 
