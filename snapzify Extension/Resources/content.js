@@ -458,12 +458,17 @@ let currentHoverAbortController = null; // Track current hover request to cancel
 // Q&A Function with conversation context
 async function getQAResponse(question, chineseText) {
     try {
-        // Add initial context if this is the first question
-        if (state.conversationHistory.length === 0) {
-            state.conversationHistory.push({
+        // Check if we need to reset context for a new text
+        const currentSystemMessage = state.conversationHistory[0];
+        const needsNewContext = !currentSystemMessage || !currentSystemMessage.content.includes(chineseText);
+
+        if (needsNewContext) {
+            // Reset conversation for new text
+            console.log('🔄 Resetting Q&A context for new text:', chineseText);
+            state.conversationHistory = [{
                 role: 'system',
                 content: `You are helping a user learn Chinese. The current subtitle/text being studied is: "${chineseText}". Answer questions about this text, its grammar, vocabulary, or cultural context. Be concise but helpful.`
-            });
+            }];
         }
 
         // Add the user's question
@@ -814,6 +819,15 @@ function createSubtitlePopup(text) {
         console.log('🧹 Removing existing popup');
         state.currentPopup.remove();
         state.currentPopup = null;
+    }
+
+    // Reset conversation history when creating a new popup with different text
+    if (state.conversationHistory.length > 0) {
+        const currentSystemMessage = state.conversationHistory[0];
+        if (currentSystemMessage && !currentSystemMessage.content.includes(text)) {
+            console.log('🔄 Clearing conversation history for new popup');
+            state.conversationHistory = [];
+        }
     }
 
     // Remove any orphaned popups (safety cleanup)
@@ -1192,8 +1206,8 @@ function createSubtitlePopup(text) {
         qaResponseArea.style.display = 'block';
         qaResponseArea.innerHTML = '<div style="color: rgba(255, 255, 255, 0.6);">Thinking...</div>';
 
-        // Get answer from ChatGPT
-        const answer = await getQAResponse(question, cleanedText);
+        // Get answer from ChatGPT using the CURRENT subtitle text
+        const answer = await getQAResponse(question, state.currentSubtitleText || cleanedText);
 
         // Display answer
         if (answer) {
