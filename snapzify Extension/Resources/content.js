@@ -23,6 +23,45 @@ const state = {
     conversationHistory: [] // Store conversation context for Q&A
 };
 
+// Helper function to get the correct container for popups (handles fullscreen)
+function getPopupContainer() {
+    // Check for fullscreen elements including Viki's custom fullscreen
+    const fullscreenElement = document.fullscreenElement ||
+                            document.webkitFullscreenElement ||
+                            document.querySelector('.video-js.vjs-fullscreen') ||
+                            document.querySelector('[data-fullscreen="true"]') ||
+                            document.querySelector('.vjs-fullscreen');
+
+    return fullscreenElement || document.body;
+}
+
+// Helper function to update popup with partial streaming data
+function updatePopupWithPartialData(partialData) {
+    if (!state.currentPopup) return;
+
+    const chineseTextDiv = state.currentPopup.querySelector('#chinese-text');
+    if (!chineseTextDiv || !partialData.characters) return;
+
+    // Update pinyin as it arrives
+    const charDivs = chineseTextDiv.querySelectorAll('[data-char]');
+    partialData.characters.forEach((charData, index) => {
+        if (charDivs[index] && charData.pinyin) {
+            const pinyinSpan = charDivs[index].querySelector('.pinyin-label');
+            if (pinyinSpan) {
+                pinyinSpan.textContent = charData.pinyin;
+            }
+        }
+    });
+
+    // Update meaning if available
+    if (partialData.meaning) {
+        const meaningDiv = state.currentPopup.querySelector('#chinese-meaning');
+        if (meaningDiv) {
+            meaningDiv.textContent = partialData.meaning;
+        }
+    }
+}
+
 // Resume video and clean up all UI elements
 function resumeVideo() {
     // Clear any hover popups
@@ -49,10 +88,12 @@ function resumeVideo() {
 // Send text to ChatGPT for breakdown
 async function getChatGPTBreakdown(chineseText, retryCount = 0) {
     const MAX_RETRIES = 2;
+    const functionStartTime = performance.now();
 
     try {
         console.log(`🤖 Getting analysis (attempt ${retryCount + 1}):`, chineseText);
 
+        const requestBodyStartTime = performance.now();
         const requestBody = {
             model: 'gpt-3.5-turbo',
             messages: [{
@@ -73,11 +114,14 @@ Return JSON with EXACTLY ${chineseText.match(/[\u4e00-\u9fff]/g)?.length || 0} e
 MAINTAIN EXACT CHARACTER ORDER!`
             }],
             max_tokens: 500,
-            temperature: 0
+            temperature: 0,
+            stream: true  // Enable streaming
         };
 
         console.log('🤖 CHATGPT API: Using model:', requestBody.model);
+        console.log('⏱️ Request body creation:', (performance.now() - requestBodyStartTime).toFixed(2) + 'ms');
 
+        const fetchStartTime = performance.now();
         const response = await fetch('https://api.openai.com/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -87,10 +131,10 @@ MAINTAIN EXACT CHARACTER ORDER!`
             body: JSON.stringify(requestBody)
         });
 
+        const fetchEndTime = performance.now();
         console.log('🤖 CHATGPT API: Response received');
+        console.log('⏱️ Network request time:', (fetchEndTime - fetchStartTime).toFixed(2) + 'ms');
         console.log('  - Status:', response.status);
-        console.log('  - Status text:', response.statusText);
-        console.log('  - Headers:', Object.fromEntries(response.headers.entries()));
 
         if (!response.ok) {
             const errorText = await response.text();
@@ -100,14 +144,88 @@ MAINTAIN EXACT CHARACTER ORDER!`
             return null;
         }
 
-        const data = await response.json();
-        console.log('🤖 CHATGPT API: JSON response parsed');
-        console.log('  - Full response:', JSON.stringify(data, null, 2));
+        // Handle streaming response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullContent = '';
+        let firstChunkTime = null;
+
+        console.log('🤖 CHATGPT API: Starting to read stream...');
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            if (!firstChunkTime) {
+                firstChunkTime = performance.now();
+                console.log('⏱️ Time to first chunk:', (firstChunkTime - fetchStartTime).toFixed(2) + 'ms');
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+
+                    try {
+                        const parsed = JSON.parse(data);
+                        const delta = parsed.choices?.[0]?.delta?.content;
+                        if (delta) {
+                            fullContent += delta;
+
+                            // Try to parse and update UI with partial JSON
+                            if (fullContent.includes('{')) {
+                                const jsonMatch = fullContent.match(/\{[\s\S]*/);
+                                if (jsonMatch) {
+                                    try {
+                                        // Attempt to close unclosed JSON for preview
+                                        let testJSON = jsonMatch[0];
+                                        const openBraces = (testJSON.match(/\{/g) || []).length;
+                                        const closeBraces = (testJSON.match(/\}/g) || []).length;
+                                        const openBrackets = (testJSON.match(/\[/g) || []).length;
+                                        const closeBrackets = (testJSON.match(/\]/g) || []).length;
+
+                                        // Add closing brackets/braces if needed
+                                        if (openBrackets > closeBrackets) {
+                                            testJSON += ']'.repeat(openBrackets - closeBrackets);
+                                        }
+                                        if (openBraces > closeBraces) {
+                                            testJSON += '}'.repeat(openBraces - closeBraces);
+                                        }
+
+                                        const tempParsed = JSON.parse(testJSON);
+
+                                        // Update UI with partial data
+                                        if (tempParsed.characters && tempParsed.characters.length > 0) {
+                                            updatePopupWithPartialData(tempParsed);
+                                        }
+                                    } catch (e) {
+                                        // Partial JSON not yet valid, continue
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Error parsing stream chunk:', e);
+                    }
+                }
+            }
+        }
+
+        const streamEndTime = performance.now();
+        console.log('🤖 CHATGPT API: Stream complete');
+        console.log('⏱️ Total streaming time:', (streamEndTime - fetchStartTime).toFixed(2) + 'ms');
+
+        // Parse final complete response
+        const data = { choices: [{ message: { content: fullContent } }] };
+        console.log('🤖 CHATGPT API: Final response assembled');
 
         if (data.choices && data.choices[0] && data.choices[0].message) {
             console.log('🤖 CHATGPT API: Processing response message...');
-            console.log('  - Number of choices:', data.choices.length);
-            console.log('  - Choice 0 structure:', Object.keys(data.choices[0]));
 
             try {
                 const content = data.choices[0].message.content;
@@ -188,9 +306,11 @@ MAINTAIN EXACT CHARACTER ORDER!`
 
 // Process subtitle text with ChatGPT
 async function processSubtitleWithChatGPT(subtitleText) {
+    const startTime = performance.now();
     console.log('=== Starting ChatGPT Processing ===');
     console.log('📊 Processing subtitle text:', `"${subtitleText}"`);
     console.log('📊 OpenAI Key available:', !!state.openaiKey);
+    console.log('⏱️ Start time:', new Date().toISOString());
 
     if (!state.openaiKey) {
         console.log('❌ No OpenAI key available');
@@ -211,22 +331,35 @@ async function processSubtitleWithChatGPT(subtitleText) {
 
     // Also check response cache
     if (state.responseCache && state.responseCache[subtitleText]) {
+        const cacheTime = performance.now() - startTime;
         console.log('📊 Found in response cache, using cached data');
+        console.log('⏱️ Cache retrieval time:', cacheTime.toFixed(2) + 'ms');
         state.chatgptBreakdown = state.responseCache[subtitleText];
         state.lastProcessedText = subtitleText;
         createSubtitlePopup(subtitleText);
         return;
     }
 
+    // Create popup immediately with loading state (before API call)
+    if (!state.isPopupOpen) {
+        console.log('📊 Creating popup immediately with loading state');
+        state.chatgptBreakdown = null; // Clear old data
+        createSubtitlePopup(subtitleText);
+    }
+
     // Get ChatGPT breakdown
-    console.log('📊 Starting ChatGPT analysis...');
+    console.log('📊 Starting ChatGPT API call...');
+    const apiStartTime = performance.now();
     const breakdown = await getChatGPTBreakdown(subtitleText);
-    console.log('📊 ChatGPT analysis complete');
+    const apiEndTime = performance.now();
+    console.log('📊 ChatGPT API call complete');
+    console.log('⏱️ API call duration:', (apiEndTime - apiStartTime).toFixed(2) + 'ms');
     console.log('  - Breakdown result:', breakdown);
     console.log('  - Has characters array:', !!(breakdown && breakdown.characters));
     console.log('  - Characters count:', breakdown && breakdown.characters ? breakdown.characters.length : 0);
 
     if (breakdown && breakdown.characters && breakdown.characters.length > 0) {
+        const processingStartTime = performance.now();
         state.chatgptBreakdown = breakdown;
         state.lastProcessedText = subtitleText; // Cache the processed text
 
@@ -243,20 +376,19 @@ async function processSubtitleWithChatGPT(subtitleText) {
         console.log('✅ ChatGPT breakdown received and cached');
         console.log('  - Sample character:', breakdown.characters[0]);
 
-        // Update existing popup if open, otherwise create new one
-        if (state.isPopupOpen && state.currentPopup) {
-            console.log('📊 Updating existing popup with ChatGPT data');
-            updatePopupWithChatGPTData(breakdown);
-        } else {
-            console.log('📊 Creating popup with ChatGPT breakdown');
-            createSubtitlePopup(subtitleText);
-        }
+        // Always update the existing popup (it should already be open)
+        console.log('📊 Updating popup with final ChatGPT data');
+        const updateStartTime = performance.now();
+        updatePopupWithChatGPTData(breakdown);
+        const updateEndTime = performance.now();
+        console.log('⏱️ Popup update time:', (updateEndTime - updateStartTime).toFixed(2) + 'ms');
+
+        const totalTime = performance.now() - startTime;
+        console.log('⏱️ TOTAL PROCESSING TIME:', totalTime.toFixed(2) + 'ms');
+        console.log('⏱️ Breakdown: API=' + (apiEndTime - apiStartTime).toFixed(0) + 'ms, Processing=' + (performance.now() - processingStartTime).toFixed(0) + 'ms');
     } else {
         console.error('❌ Failed to get valid ChatGPT breakdown');
-        console.log('  - Will create popup without breakdown data');
-        if (!state.isPopupOpen) {
-            createSubtitlePopup(subtitleText);
-        }
+        console.log('  - Popup should already exist in loading state');
     }
 }
 
@@ -486,7 +618,7 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         <div style="font-size: 18px; margin-bottom: 4px;">${charDiv.dataset.char}</div>
         <div style="color: rgba(255, 255, 255, 0.6);">Processing...</div>
     `;
-    document.body.appendChild(hoverPopup);
+    getPopupContainer().appendChild(hoverPopup);
 
     // Get word analysis from ChatGPT (with abort signal)
     const analysis = await getWordAnalysis(charDiv.dataset.char, fullText, charIndex, currentHoverAbortController.signal);
@@ -589,7 +721,7 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
             max-width: 300px;
             line-height: 1.4;
         `;
-        document.body.appendChild(hoverPopup);
+        getPopupContainer().appendChild(hoverPopup);
     }
 
     // Update popup styling for results
@@ -1127,20 +1259,10 @@ function createSubtitlePopup(text) {
         e.stopPropagation();
     });
 
-    // Append popup to fullscreen element or body
-    const fullscreenElement = document.fullscreenElement ||
-                             document.webkitFullscreenElement ||
-                             document.querySelector('.video-js.vjs-fullscreen') ||
-                             document.querySelector('[data-fullscreen="true"]') ||
-                             document.querySelector('.vjs-fullscreen');
-
-    if (fullscreenElement) {
-        fullscreenElement.appendChild(popup);
-        console.log('Popup appended to fullscreen element');
-    } else {
-        document.body.appendChild(popup);
-        console.log('Popup appended to body');
-    }
+    // Append popup to correct container (handles fullscreen)
+    const container = getPopupContainer();
+    container.appendChild(popup);
+    console.log('Popup appended to:', container === document.body ? 'body' : 'fullscreen element');
 
     state.currentPopup = popup;
 }
@@ -1321,6 +1443,26 @@ async function loadStoredKeys() {
 
 // Initialize extension
 console.log("Initializing SubLex extension...");
-loadStoredKeys();
-setupVideoMonitoring();
-setupSubtitleMonitoring();
+console.log("Current URL:", window.location.href);
+console.log("Is Viki domain:", window.location.hostname.includes('viki.com'));
+
+try {
+    loadStoredKeys();
+    console.log("✅ loadStoredKeys completed");
+} catch (error) {
+    console.error("❌ Error in loadStoredKeys:", error);
+}
+
+try {
+    setupVideoMonitoring();
+    console.log("✅ setupVideoMonitoring completed");
+} catch (error) {
+    console.error("❌ Error in setupVideoMonitoring:", error);
+}
+
+try {
+    setupSubtitleMonitoring();
+    console.log("✅ setupSubtitleMonitoring completed");
+} catch (error) {
+    console.error("❌ Error in setupSubtitleMonitoring:", error);
+}
