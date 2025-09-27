@@ -22,8 +22,21 @@ const state = {
     responseCache: {} // Cache API responses for speed
 };
 
-// Resume video
+// Resume video and clean up all UI elements
 function resumeVideo() {
+    // Clear any hover popups
+    if (hoverPopup) {
+        hoverPopup.remove();
+        hoverPopup = null;
+    }
+
+    // Clear highlights
+    highlightedChars.forEach(el => {
+        el.style.backgroundColor = 'transparent';
+    });
+    highlightedChars = [];
+
+    // Resume video playback
     const video = document.querySelector('video');
     if (video && video.paused && state.wasPlayingBeforePopup) {
         video.play();
@@ -33,20 +46,28 @@ function resumeVideo() {
 
 
 // Send text to ChatGPT for breakdown
-async function getChatGPTBreakdown(chineseText) {
+async function getChatGPTBreakdown(chineseText, retryCount = 0) {
+    const MAX_RETRIES = 2;
+
     try {
-        console.log('🤖 Getting basic analysis:', chineseText);
+        console.log(`🤖 Getting analysis (attempt ${retryCount + 1}):`, chineseText);
 
         const requestBody = {
             model: 'gpt-3.5-turbo',
             messages: [{
                 role: 'user',
-                content: `Chinese: ${chineseText}
+                content: `Analyze: ${chineseText}
 
-Return JSON with pinyin for each character and overall meaning:
-{"meaning":"English translation","characters":[{"character":"你","pinyin":"nǐ"},{"character":"好","pinyin":"hǎo"}...]}`
+CRITICAL: Provide pinyin for EACH INDIVIDUAL CHARACTER, not words!
+For "工作" return TWO entries: {"character":"工","pinyin":"gōng"} and {"character":"作","pinyin":"zuò"}
+NOT one entry: {"character":"工作","pinyin":"gōngzuò"}
+
+Return JSON:
+{"meaning":"English translation","characters":[{"character":"工","pinyin":"gōng"},{"character":"作","pinyin":"zuò"}...]}
+
+Each entry must be a SINGLE character only!`
             }],
-            max_tokens: 300,
+            max_tokens: 500,
             temperature: 0
         };
 
@@ -89,11 +110,27 @@ Return JSON with pinyin for each character and overall meaning:
                 const jsonMatch = content.match(/\{[\s\S]*\}/);
 
                 if (jsonMatch) {
-
                     const parsed = JSON.parse(jsonMatch[0]);
 
-                    if (parsed.characters && parsed.characters.length > 0) {
+                    // Validate response structure
+                    if (!parsed.characters || !Array.isArray(parsed.characters)) {
+                        throw new Error('Invalid response: missing or invalid characters array');
+                    }
 
+                    // Validate each character has required fields
+                    for (const char of parsed.characters) {
+                        if (!char.character || !char.pinyin) {
+                            console.warn('⚠️ Character missing required fields:', char);
+                            // Provide defaults to prevent crashes
+                            char.character = char.character || '?';
+                            char.pinyin = char.pinyin || '';
+                        }
+                    }
+
+                    // Validate character count matches input
+                    const expectedChars = chineseText.match(/[\u4e00-\u9fff]/g) || [];
+                    if (parsed.characters.length !== expectedChars.length) {
+                        console.warn(`⚠️ Character count mismatch: expected ${expectedChars.length}, got ${parsed.characters.length}`);
                     }
 
                     return parsed;
@@ -120,10 +157,17 @@ Return JSON with pinyin for each character and overall meaning:
 
         return null;
     } catch (error) {
-        console.error('🤖 CHATGPT API: Exception occurred');
-        console.error('  - Error name:', error.name);
-        console.error('  - Error message:', error.message);
-        console.error('  - Error stack:', error.stack);
+        console.error(`🤖 CHATGPT API: Exception on attempt ${retryCount + 1}`);
+        console.error('  - Error:', error.message);
+
+        // Retry if we haven't exceeded max attempts
+        if (retryCount < MAX_RETRIES) {
+            console.log(`🔄 Retrying... (attempt ${retryCount + 2} of ${MAX_RETRIES + 1})`);
+            await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1))); // Exponential backoff
+            return getChatGPTBreakdown(chineseText, retryCount + 1);
+        }
+
+        console.error('❌ All retry attempts failed');
         return null;
     }
 }
@@ -206,22 +250,25 @@ async function processSubtitleWithChatGPT(subtitleText) {
 function updatePopupWithChatGPTData(breakdown) {
     if (!state.currentPopup) return;
 
-    // Update pinyin and data attributes
-    let charDataIndex = 0;
+    // Update pinyin for Chinese characters only
+    let chineseCharIndex = 0;
+
+    // Get all pinyin divs that have IDs (these correspond to Chinese characters)
+    const allPinyinDivs = state.currentPopup.querySelectorAll('[id^="pinyin-"]');
+    const allCharDivs = state.currentPopup.querySelectorAll('[data-char]');
+
+    // Iterate through breakdown characters and update corresponding pinyin
     breakdown.characters.forEach((charData, index) => {
-        const pinyinDiv = document.getElementById(`pinyin-${charDataIndex}`);
+        // Find the pinyin div with the matching index
+        const pinyinDiv = document.getElementById(`pinyin-${index}`);
         if (pinyinDiv && charData.pinyin) {
             pinyinDiv.textContent = charData.pinyin;
         }
 
-        // Update character pinyin only (word analysis will happen on hover)
-        const charDivs = state.currentPopup.querySelectorAll('[data-char]');
-        if (charDivs[charDataIndex]) {
-            const charDiv = charDivs[charDataIndex];
-            charDiv.dataset.pinyin = charData.pinyin || '';
+        // Also update the data attribute on the character div
+        if (allCharDivs[index]) {
+            allCharDivs[index].dataset.pinyin = charData.pinyin || '';
         }
-
-        charDataIndex++;
     });
 
     // Update meaning section
@@ -241,21 +288,23 @@ function updatePopupWithChatGPTData(breakdown) {
 // Global hover popup state
 let hoverPopup = null;
 let highlightedChars = [];
+let currentHoverAbortController = null; // Track current hover request to cancel if needed
 
 // Phase 2: Get word analysis on hover
-async function getWordAnalysis(character, fullText, charIndex) {
+async function getWordAnalysis(character, fullText, charIndex, abortSignal, retryCount = 0) {
+    const MAX_RETRIES = 1; // Fewer retries for hover to keep it snappy
+
     try {
         const requestBody = {
             model: 'gpt-3.5-turbo',
             messages: [{
                 role: 'user',
                 content: `Text: ${fullText}
-Character at index ${charIndex}: "${character}"
+Character at position ${charIndex}: "${character}"
 
-Check if this character is part of a multi-character word.
-If yes, return the complete word and definitions.
+Analyze if this character is part of a multi-character word in this context.
 
-Return JSON:
+Return ONLY valid JSON:
 {"isWord":true/false,"word":"complete word","wordDef":"meaning","chars":[{"char":"X","pinyin":"X","def":"individual meaning"}]}`
             }],
             max_tokens: 300,
@@ -268,7 +317,8 @@ Return JSON:
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${state.openaiKey}`
             },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify(requestBody),
+            signal: abortSignal // Pass abort signal to fetch
         });
 
         if (!response.ok) return null;
@@ -282,7 +332,18 @@ Return JSON:
             }
         }
     } catch (error) {
-        console.error('Error getting word analysis:', error);
+        // Check if error was due to abort
+        if (error.name === 'AbortError') {
+            console.log('Hover request cancelled');
+            return null;
+        }
+
+        console.error(`Word analysis error (attempt ${retryCount + 1}):`, error.message);
+
+        if (retryCount < MAX_RETRIES) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            return getWordAnalysis(character, fullText, charIndex, abortSignal, retryCount + 1);
+        }
     }
     return null;
 }
@@ -291,13 +352,21 @@ Return JSON:
 async function handleCharacterHover(event, charDiv, characterDataArray) {
     console.log('🎯 Hover on:', charDiv.dataset.char);
 
+    // Cancel any previous hover request
+    if (currentHoverAbortController) {
+        currentHoverAbortController.abort();
+    }
+
+    // Create new abort controller for this hover
+    currentHoverAbortController = new AbortController();
+
     // Remove any existing hover popup
     if (hoverPopup) {
         hoverPopup.remove();
         hoverPopup = null;
     }
 
-    // Clear previous highlights
+    // Clear previous highlights (but don't add new ones per user request)
     highlightedChars.forEach(el => {
         el.style.backgroundColor = 'transparent';
     });
@@ -308,11 +377,39 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
     const allCharDivs = document.querySelectorAll('#sublex-popup [data-char]');
     const charIndex = Array.from(allCharDivs).indexOf(charDiv);
 
-    // Show loading indicator
-    charDiv.style.backgroundColor = 'rgba(255, 255, 0, 0.1)';
+    // Show immediate loading popup
+    const rect = charDiv.getBoundingClientRect();
+    hoverPopup = document.createElement('div');
+    hoverPopup.style.cssText = `
+        position: fixed;
+        left: ${rect.left}px;
+        top: ${rect.bottom + 10}px;
+        background: rgba(30, 30, 40, 0.98);
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        border-radius: 8px;
+        padding: 12px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        color: white;
+        z-index: 2147483651;
+        pointer-events: none;
+        font-size: 14px;
+        min-width: 120px;
+        text-align: center;
+    `;
+    hoverPopup.innerHTML = `
+        <div style="font-size: 18px; margin-bottom: 4px;">${charDiv.dataset.char}</div>
+        <div style="color: rgba(255, 255, 255, 0.6);">Processing...</div>
+    `;
+    document.body.appendChild(hoverPopup);
 
-    // Get word analysis from ChatGPT
-    const analysis = await getWordAnalysis(charDiv.dataset.char, fullText, charIndex);
+    // Get word analysis from ChatGPT (with abort signal)
+    const analysis = await getWordAnalysis(charDiv.dataset.char, fullText, charIndex, currentHoverAbortController.signal);
+
+    // Check if this request was aborted
+    if (!analysis || currentHoverAbortController.signal.aborted) {
+        return; // Exit early if request was cancelled
+    }
+
     console.log('🎯 Analysis:', analysis);
 
     const wordChars = [];
@@ -322,15 +419,12 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         // Multi-character word found
         wordDefinition = analysis.wordDef || '';
 
-        // Find and highlight all characters in the word
+        // Find all characters in the word (no highlighting per user request)
         const wordStart = fullText.indexOf(analysis.word);
         if (wordStart !== -1) {
             for (let i = 0; i < analysis.word.length; i++) {
                 const targetDiv = allCharDivs[wordStart + i];
                 if (targetDiv) {
-                    targetDiv.style.backgroundColor = 'rgba(255, 255, 0, 0.2)';
-                    highlightedChars.push(targetDiv);
-
                     const charInfo = analysis.chars && analysis.chars[i];
                     wordChars.push({
                         char: targetDiv.dataset.char,
@@ -341,9 +435,7 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
             }
         }
     } else {
-        // Single character
-        charDiv.style.backgroundColor = 'rgba(255, 255, 0, 0.2)';
-        highlightedChars.push(charDiv);
+        // Single character (no highlighting)
         wordChars.push({
             char: charDiv.dataset.char,
             pinyin: charDiv.dataset.pinyin || '',
@@ -354,27 +446,34 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
 
     console.log('🎯 Found word characters:', wordChars);
 
-    // Create hover popup
-    hoverPopup = document.createElement('div');
-    hoverPopup.style.cssText = `
-        position: fixed;
-        background: rgba(30, 30, 40, 0.98);
-        border: 1px solid rgba(255, 255, 255, 0.3);
-        border-radius: 8px;
-        padding: 12px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-        color: white;
-        z-index: 2147483651;
-        pointer-events: none;
-        font-size: 14px;
-        max-width: 300px;
-        line-height: 1.4;
-    `;
+    // Update existing popup content (remove "Processing..." and show results)
+    if (!hoverPopup) {
+        // Safety check - create popup if it was removed
+        const rect = charDiv.getBoundingClientRect();
+        hoverPopup = document.createElement('div');
+        hoverPopup.style.cssText = `
+            position: fixed;
+            left: ${rect.left}px;
+            top: ${rect.bottom + 10}px;
+            background: rgba(30, 30, 40, 0.98);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 8px;
+            padding: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            color: white;
+            z-index: 2147483651;
+            pointer-events: none;
+            font-size: 14px;
+            max-width: 300px;
+            line-height: 1.4;
+        `;
+        document.body.appendChild(hoverPopup);
+    }
 
-    // Position popup near the character
-    const rect = charDiv.getBoundingClientRect();
-    hoverPopup.style.left = `${rect.left}px`;
-    hoverPopup.style.top = `${rect.bottom + 10}px`;
+    // Update popup styling for results
+    hoverPopup.style.minWidth = '200px';
+    hoverPopup.style.maxWidth = '300px';
+    hoverPopup.style.textAlign = 'left';
 
     // Build popup content
     const isMultiCharWord = wordChars.length > 1;
@@ -406,9 +505,7 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         `;
     }
 
-    document.body.appendChild(hoverPopup);
-
-    // Adjust position if popup goes off-screen
+    // Adjust position if popup goes off-screen (only if popup is already appended)
     const popupRect = hoverPopup.getBoundingClientRect();
     if (popupRect.right > window.innerWidth) {
         hoverPopup.style.left = `${window.innerWidth - popupRect.width - 10}px`;
@@ -420,13 +517,19 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
 
 // Handle character leave - remove hover popup
 function handleCharacterLeave() {
+    // Cancel any ongoing request
+    if (currentHoverAbortController) {
+        currentHoverAbortController.abort();
+        currentHoverAbortController = null;
+    }
+
     // Remove hover popup
     if (hoverPopup) {
         hoverPopup.remove();
         hoverPopup = null;
     }
 
-    // Clear highlights
+    // Clear any remaining highlights (shouldn't be any per user request)
     highlightedChars.forEach(el => {
         el.style.backgroundColor = 'transparent';
     });
@@ -584,6 +687,7 @@ function createSubtitlePopup(text) {
     // Create character data array from ChatGPT breakdown - indexed by position
     const characterDataArray = state.chatgptBreakdown?.characters || [];
     let charDataIndex = 0;
+    let chineseCharCount = 0; // Track Chinese character count for pinyin IDs
 
     characters.forEach((char, index) => {
         if (/[\u4e00-\u9fff]/.test(char)) {
@@ -648,7 +752,8 @@ function createSubtitlePopup(text) {
             // Only add pinyin text if we have ChatGPT data
             const pinyin = charData?.pinyin || '';
             pinyinDiv.textContent = pinyin;
-            pinyinDiv.id = `pinyin-${charDataIndex - 1}`; // Use character index for ID
+            // Create ID based on the Chinese character index (0-based)
+            pinyinDiv.id = `pinyin-${chineseCharCount}`;
 
             charColumn.appendChild(pinyinDiv);
 
@@ -661,6 +766,9 @@ function createSubtitlePopup(text) {
             charColumn.addEventListener('mouseleave', handleCharacterLeave);
 
             chineseTextContainer.appendChild(charColumn);
+
+            // Increment Chinese character counter for next character
+            chineseCharCount++;
         } else {
             // Punctuation or other character
             const punctColumn = document.createElement('div');
@@ -744,16 +852,30 @@ function createSubtitlePopup(text) {
     // Close handlers - ESC key and video resume
     const closePopup = () => {
         console.log('🧹 Closing popup and resetting state');
+
+        // Clear hover popup if exists
+        if (hoverPopup) {
+            hoverPopup.remove();
+            hoverPopup = null;
+        }
+
+        // Clear highlights
+        highlightedChars.forEach(el => {
+            el.style.backgroundColor = 'transparent';
+        });
+        highlightedChars = [];
+
+        // Remove main popup
         popup.remove();
         state.currentPopup = null;
         state.isPopupOpen = false;
 
-        // Reset processing state for clean next popup
+        // Reset processing state
         state.chatgptBreakdown = null;
         state.lastProcessedText = '';
 
         resumeVideo();
-        console.log('✅ Popup closed, state reset complete');
+        console.log('✅ All popups closed, state reset');
     };
 
     // Close on ESC key
