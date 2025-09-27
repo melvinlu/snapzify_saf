@@ -19,7 +19,8 @@ const state = {
     subtitleElement: null,
     openaiKey: null,
     chatgptBreakdown: null,
-    responseCache: {} // Cache API responses for speed
+    responseCache: {}, // Cache API responses for speed
+    conversationHistory: [] // Store conversation context for Q&A
 };
 
 // Resume video and clean up all UI elements
@@ -58,14 +59,18 @@ async function getChatGPTBreakdown(chineseText, retryCount = 0) {
                 role: 'user',
                 content: `Analyze: ${chineseText}
 
-CRITICAL: Provide pinyin for EACH INDIVIDUAL CHARACTER, not words!
-For "工作" return TWO entries: {"character":"工","pinyin":"gōng"} and {"character":"作","pinyin":"zuò"}
-NOT one entry: {"character":"工作","pinyin":"gōngzuò"}
+CRITICAL RULES:
+1. Return pinyin for EACH character IN THE EXACT ORDER they appear
+2. Include ALL particles: 的(de), 了(le), 呢(ne), 吗(ma), 吧(ba), 啊(a), etc.
+3. Handle duplicates: If "你" appears twice, include it twice with correct pinyin each time
+4. Character-by-character: "工作" = two entries: {"character":"工","pinyin":"gōng"}, {"character":"作","pinyin":"zuò"}
 
-Return JSON:
-{"meaning":"English translation","characters":[{"character":"工","pinyin":"gōng"},{"character":"作","pinyin":"zuò"}...]}
+The text has these Chinese characters in order: ${(chineseText.match(/[\u4e00-\u9fff]/g) || []).join(', ')}
 
-Each entry must be a SINGLE character only!`
+Return JSON with EXACTLY ${chineseText.match(/[\u4e00-\u9fff]/g)?.length || 0} entries in this EXACT order:
+{"meaning":"English translation","characters":[{"character":"X","pinyin":"X"}...]}
+
+MAINTAIN EXACT CHARACTER ORDER!`
             }],
             max_tokens: 500,
             temperature: 0
@@ -131,6 +136,15 @@ Each entry must be a SINGLE character only!`
                     const expectedChars = chineseText.match(/[\u4e00-\u9fff]/g) || [];
                     if (parsed.characters.length !== expectedChars.length) {
                         console.warn(`⚠️ Character count mismatch: expected ${expectedChars.length}, got ${parsed.characters.length}`);
+                    }
+
+                    // Validate that characters match the actual text order
+                    for (let i = 0; i < Math.min(expectedChars.length, parsed.characters.length); i++) {
+                        if (expectedChars[i] !== parsed.characters[i].character) {
+                            console.error(`⚠️ Character mismatch at position ${i}: expected "${expectedChars[i]}", got "${parsed.characters[i].character}"`);
+                            // Try to fix by matching the expected character
+                            parsed.characters[i].character = expectedChars[i];
+                        }
                     }
 
                     return parsed;
@@ -250,24 +264,28 @@ async function processSubtitleWithChatGPT(subtitleText) {
 function updatePopupWithChatGPTData(breakdown) {
     if (!state.currentPopup) return;
 
-    // Update pinyin for Chinese characters only
-    let chineseCharIndex = 0;
-
-    // Get all pinyin divs that have IDs (these correspond to Chinese characters)
-    const allPinyinDivs = state.currentPopup.querySelectorAll('[id^="pinyin-"]');
+    // Get all character divs and filter for Chinese characters only
     const allCharDivs = state.currentPopup.querySelectorAll('[data-char]');
+    const chineseCharDivs = [];
+
+    // Build array of only Chinese character divs
+    allCharDivs.forEach(div => {
+        if (/[\u4e00-\u9fff]/.test(div.dataset.char)) {
+            chineseCharDivs.push(div);
+        }
+    });
 
     // Iterate through breakdown characters and update corresponding pinyin
     breakdown.characters.forEach((charData, index) => {
-        // Find the pinyin div with the matching index
+        // Find the pinyin div with the matching index (0-based Chinese char index)
         const pinyinDiv = document.getElementById(`pinyin-${index}`);
         if (pinyinDiv && charData.pinyin) {
             pinyinDiv.textContent = charData.pinyin;
         }
 
-        // Also update the data attribute on the character div
-        if (allCharDivs[index]) {
-            allCharDivs[index].dataset.pinyin = charData.pinyin || '';
+        // Also update the data attribute on the Chinese character div
+        if (chineseCharDivs[index]) {
+            chineseCharDivs[index].dataset.pinyin = charData.pinyin || '';
         }
     });
 
@@ -290,6 +308,71 @@ let hoverPopup = null;
 let highlightedChars = [];
 let currentHoverAbortController = null; // Track current hover request to cancel if needed
 
+// Q&A Function with conversation context
+async function getQAResponse(question, chineseText) {
+    try {
+        // Add initial context if this is the first question
+        if (state.conversationHistory.length === 0) {
+            state.conversationHistory.push({
+                role: 'system',
+                content: `You are helping a user learn Chinese. The current subtitle/text being studied is: "${chineseText}". Answer questions about this text, its grammar, vocabulary, or cultural context. Be concise but helpful.`
+            });
+        }
+
+        // Add the user's question
+        state.conversationHistory.push({
+            role: 'user',
+            content: question
+        });
+
+        const requestBody = {
+            model: 'gpt-3.5-turbo',
+            messages: state.conversationHistory,
+            max_tokens: 300,
+            temperature: 0.7
+        };
+
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${state.openaiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+            console.error('Q&A API error:', response.status);
+            return null;
+        }
+
+        const data = await response.json();
+        if (data.choices && data.choices[0] && data.choices[0].message) {
+            const answer = data.choices[0].message.content;
+
+            // Add assistant's response to conversation history
+            state.conversationHistory.push({
+                role: 'assistant',
+                content: answer
+            });
+
+            // Keep conversation history manageable (last 10 exchanges)
+            if (state.conversationHistory.length > 21) { // 1 system + 10 Q&A pairs
+                // Keep system message and last 10 exchanges
+                state.conversationHistory = [
+                    state.conversationHistory[0],
+                    ...state.conversationHistory.slice(-20)
+                ];
+            }
+
+            return answer;
+        }
+    } catch (error) {
+        console.error('Q&A error:', error);
+    }
+    return null;
+}
+
 // Phase 2: Get word analysis on hover
 async function getWordAnalysis(character, fullText, charIndex, abortSignal, retryCount = 0) {
     const MAX_RETRIES = 1; // Fewer retries for hover to keep it snappy
@@ -302,10 +385,13 @@ async function getWordAnalysis(character, fullText, charIndex, abortSignal, retr
                 content: `Text: ${fullText}
 Character at position ${charIndex}: "${character}"
 
-Analyze if this character is part of a multi-character word in this context.
+Analyze if this character is part of a multi-character word OR is a particle.
+If it's a particle (的,了,呢,吗,吧,啊,etc), provide its pinyin and grammatical function.
 
 Return ONLY valid JSON:
-{"isWord":true/false,"word":"complete word","wordDef":"meaning","chars":[{"char":"X","pinyin":"X","def":"individual meaning"}]}`
+{"isWord":true/false,"word":"complete word","wordDef":"meaning","chars":[{"char":"X","pinyin":"X","def":"meaning/function"}]}
+
+For particles like 的, return: {"isWord":false,"chars":[{"char":"的","pinyin":"de","def":"possessive particle"}]}`
             }],
             max_tokens: 300,
             temperature: 0
@@ -419,11 +505,39 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         // Multi-character word found
         wordDefinition = analysis.wordDef || '';
 
-        // Find all characters in the word (no highlighting per user request)
-        const wordStart = fullText.indexOf(analysis.word);
-        if (wordStart !== -1) {
+        // Use the character index to find the correct word position
+        // The word should include the hovered character at charIndex
+        let wordStartIndex = -1;
+
+        // Convert allCharDivs to array of Chinese characters only
+        const chineseCharDivs = [];
+        allCharDivs.forEach(div => {
+            if (/[\u4e00-\u9fff]/.test(div.dataset.char)) {
+                chineseCharDivs.push(div);
+            }
+        });
+
+        // Find where in the Chinese characters our hovered char is
+        const chineseCharIndex = chineseCharDivs.indexOf(charDiv);
+
+        // Look for the word starting at or before the current character
+        for (let startPos = Math.max(0, chineseCharIndex - analysis.word.length + 1); startPos <= chineseCharIndex; startPos++) {
+            let matches = true;
+            for (let i = 0; i < analysis.word.length && startPos + i < chineseCharDivs.length; i++) {
+                if (chineseCharDivs[startPos + i].dataset.char !== analysis.word[i]) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches && startPos <= chineseCharIndex && startPos + analysis.word.length > chineseCharIndex) {
+                wordStartIndex = startPos;
+                break;
+            }
+        }
+
+        if (wordStartIndex !== -1) {
             for (let i = 0; i < analysis.word.length; i++) {
-                const targetDiv = allCharDivs[wordStart + i];
+                const targetDiv = chineseCharDivs[wordStartIndex + i];
                 if (targetDiv) {
                     const charInfo = analysis.chars && analysis.chars[i];
                     wordChars.push({
@@ -433,12 +547,20 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
                     });
                 }
             }
+        } else {
+            // Fallback - word not found at expected position, show single character
+            wordChars.push({
+                char: charDiv.dataset.char,
+                pinyin: analysis?.chars?.[0]?.pinyin || charDiv.dataset.pinyin || '',
+                individualDefinition: analysis?.chars?.[0]?.def || ''
+            });
+            wordDefinition = analysis?.chars?.[0]?.def || '';
         }
     } else {
-        // Single character (no highlighting)
+        // Single character (including particles)
         wordChars.push({
             char: charDiv.dataset.char,
-            pinyin: charDiv.dataset.pinyin || '',
+            pinyin: analysis?.chars?.[0]?.pinyin || charDiv.dataset.pinyin || '',
             individualDefinition: analysis?.chars?.[0]?.def || ''
         });
         wordDefinition = analysis?.chars?.[0]?.def || '';
@@ -847,11 +969,124 @@ function createSubtitlePopup(text) {
     }
 
     contentContainer.appendChild(breakdownContainer);
+
+    // Add Q&A section
+    const qaSection = document.createElement('div');
+    qaSection.style.cssText = `
+        margin-top: 12px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 8px;
+    `;
+
+    // Q&A response area
+    const qaResponseArea = document.createElement('div');
+    qaResponseArea.id = 'qa-response';
+    qaResponseArea.style.cssText = `
+        margin-bottom: 10px;
+        max-height: 150px;
+        overflow-y: auto;
+        display: none;
+    `;
+    qaSection.appendChild(qaResponseArea);
+
+    // Q&A input container
+    const qaInputContainer = document.createElement('div');
+    qaInputContainer.style.cssText = `
+        display: flex;
+        gap: 8px;
+        align-items: center;
+    `;
+
+    // Q&A input field
+    const qaInput = document.createElement('input');
+    qaInput.type = 'text';
+    qaInput.placeholder = '';
+    qaInput.style.cssText = `
+        flex: 1;
+        padding: 8px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: white;
+        font-size: 13px;
+    `;
+
+    // Send button
+    const qaSendBtn = document.createElement('button');
+    qaSendBtn.textContent = 'Ask';
+    qaSendBtn.style.cssText = `
+        padding: 8px 15px;
+        background: rgba(255, 255, 255, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+    qaSendBtn.onmouseover = () => {
+        qaSendBtn.style.background = 'rgba(255, 255, 255, 0.2)';
+        qaSendBtn.style.borderColor = 'rgba(255, 255, 255, 0.3)';
+    };
+    qaSendBtn.onmouseout = () => {
+        qaSendBtn.style.background = 'rgba(255, 255, 255, 0.15)';
+        qaSendBtn.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+    };
+
+    // Handle question submission
+    const submitQuestion = async () => {
+        const question = qaInput.value.trim();
+        if (!question) return;
+
+        // Show response area and display loading
+        qaResponseArea.style.display = 'block';
+        qaResponseArea.innerHTML = '<div style="color: rgba(255, 255, 255, 0.6);">Thinking...</div>';
+
+        // Get answer from ChatGPT
+        const answer = await getQAResponse(question, cleanedText);
+
+        // Display answer
+        if (answer) {
+            qaResponseArea.innerHTML = `
+                <div style="margin-bottom: 8px; padding: 8px; background: rgba(255, 255, 255, 0.05); border-radius: 4px;">
+                    <strong>Q:</strong> ${question}
+                </div>
+                <div style="padding: 8px; background: rgba(255, 255, 255, 0.08); border-radius: 4px;">
+                    <strong>A:</strong> ${answer}
+                </div>
+            `;
+        } else {
+            qaResponseArea.innerHTML = '<div style="color: rgba(255, 100, 100, 0.8);">Failed to get response. Please try again.</div>';
+        }
+
+        // Clear input
+        qaInput.value = '';
+    };
+
+    qaSendBtn.onclick = submitQuestion;
+    qaInput.onkeypress = (e) => {
+        if (e.key === 'Enter') submitQuestion();
+    };
+
+    qaInputContainer.appendChild(qaInput);
+    qaInputContainer.appendChild(qaSendBtn);
+    qaSection.appendChild(qaInputContainer);
+
+    contentContainer.appendChild(qaSection);
     popup.appendChild(contentContainer);
+
+    // Auto-focus the Q&A input after a small delay to ensure popup is rendered
+    setTimeout(() => {
+        qaInput.focus();
+    }, 100);
 
     // Close handlers - ESC key and video resume
     const closePopup = () => {
         console.log('🧹 Closing popup and resetting state');
+
+        // Clear conversation history when closing
+        state.conversationHistory = [];
 
         // Clear hover popup if exists
         if (hoverPopup) {
