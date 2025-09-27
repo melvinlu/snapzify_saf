@@ -18,7 +18,8 @@ const state = {
     wasPlayingBeforePopup: false,
     subtitleElement: null,
     openaiKey: null,
-    chatgptBreakdown: null
+    chatgptBreakdown: null,
+    responseCache: {} // Cache API responses for speed
 };
 
 // Resume video
@@ -32,137 +33,24 @@ function resumeVideo() {
 
 
 // Send text to ChatGPT for breakdown
-// Fix word grouping issues in ChatGPT response
-function fixWordGrouping(characters, originalText) {
-    // Common multi-character words and patterns
-    const commonWords = [
-        '怎么样', '怎么', '什么', '这边', '那边', '我们', '你们', '他们',
-        '公司', '时间', '地方', '可以', '但是', '因为', '所以', '现在',
-        '已经', '还是', '或者', '如果', '虽然', '不过', '而且', '然后'
-    ];
-
-    // Build the full text from characters
-    const fullText = characters.map(c => c.character).join('');
-
-    // First pass: identify and fix known common words
-    for (const word of commonWords) {
-        const index = fullText.indexOf(word);
-        if (index !== -1) {
-            // Update all characters in this word to have the same wordGroup
-            for (let i = 0; i < word.length; i++) {
-                if (characters[index + i]) {
-                    characters[index + i].wordGroup = word;
-                }
-            }
-        }
-    }
-
-    // Second pass: identify potential names (2-3 consecutive characters that look like names)
-    // Names typically don't contain common single-character words
-    const singleCharWords = ['的', '了', '是', '在', '有', '个', '和', '与', '以', '不', '这', '那', '就', '都', '也', '又', '把', '被', '让', '给', '跟', '对'];
-
-    let i = 0;
-    while (i < characters.length) {
-        const char = characters[i].character;
-
-        // Check if this could be the start of a name
-        if (!singleCharWords.includes(char)) {
-            // Look ahead for 2-3 character sequences that could be names
-            let possibleName = char;
-            let nameLength = 1;
-
-            // Check next 1-2 characters
-            for (let j = 1; j <= 2 && i + j < characters.length; j++) {
-                const nextChar = characters[i + j].character;
-                if (!singleCharWords.includes(nextChar) && !commonWords.some(w => w.startsWith(nextChar))) {
-                    possibleName += nextChar;
-                    nameLength++;
-                } else {
-                    break;
-                }
-            }
-
-            // If we found a 2-3 character sequence, check if they already have different wordGroups
-            if (nameLength >= 2) {
-                const differentGroups = new Set();
-                for (let j = 0; j < nameLength; j++) {
-                    differentGroups.add(characters[i + j].wordGroup);
-                }
-
-                // If they have different groups but look like they should be together
-                // (all single-character wordGroups), merge them
-                if (differentGroups.size > 1) {
-                    let allSingleChar = true;
-                    for (let j = 0; j < nameLength; j++) {
-                        if (characters[i + j].wordGroup.length > 1) {
-                            allSingleChar = false;
-                            break;
-                        }
-                    }
-
-                    if (allSingleChar) {
-                        // This looks like a name that wasn't properly grouped
-                        console.log(`🔧 Fixing potential name: ${possibleName}`);
-                        for (let j = 0; j < nameLength; j++) {
-                            characters[i + j].wordGroup = possibleName;
-                            characters[i + j].definition = `${possibleName} (name/phrase)`;
-                        }
-                    }
-                }
-            }
-
-            i += nameLength;
-        } else {
-            i++;
-        }
-    }
-
-    return characters;
-}
-
 async function getChatGPTBreakdown(chineseText) {
     try {
-        console.log('🤖 CHATGPT API: Starting OpenAI API request...');
-        console.log('  - Input text:', `"${chineseText}"`);
-        console.log('  - Input length:', chineseText.length);
-        console.log('  - API key (first 20 chars):', state.openaiKey.substring(0, 20) + '...');
+        console.log('🤖 Getting basic analysis:', chineseText);
 
         const requestBody = {
-            model: 'gpt-4',
-            messages: [
-                {
-                    role: 'system',
-                    content: 'You are a Chinese language expert. You MUST segment text into words correctly. Names like "盛哲宁" are single words. Common phrases like "怎么样", "我们", "公司" are single words. CRITICAL: The wordGroup field must contain the COMPLETE multi-character word, not just the single character.'
-                },
-                {
-                    role: 'user',
-                    content: `Segment this Chinese text into words, then analyze each character:
+            model: 'gpt-3.5-turbo',
+            messages: [{
+                role: 'user',
+                content: `Chinese: ${chineseText}
 
-"${chineseText}"
-
-STEP 1: Identify word boundaries. Names (2-3 chars) are single words. Common phrases (怎么样, 我们, 这边, 那边, 公司, etc.) are single words.
-
-STEP 2: For EVERY character, set wordGroup to the FULL WORD it belongs to.
-
-Example: For "盛哲宁" (a name), ALL three characters must have wordGroup: "盛哲宁"
-NOT wordGroup: "盛", "哲", "宁" (WRONG!)
-
-Return ONLY this JSON:
-{
-  "meaning": "English translation",
-  "characters": [
-    {"character": "X", "pinyin": "X_pinyin", "wordGroup": "FULL_WORD", "definition": "word_meaning", "individualDefinition": "char_meaning"}
-  ]
-}`
-                }
-            ],
-            max_tokens: 1500,
-            temperature: 0.1
+Return JSON with pinyin for each character and overall meaning:
+{"meaning":"English translation","characters":[{"character":"你","pinyin":"nǐ"},{"character":"好","pinyin":"hǎo"}...]}`
+            }],
+            max_tokens: 300,
+            temperature: 0
         };
 
-        console.log('🤖 CHATGPT API: Request body prepared');
-        console.log('  - Model:', requestBody.model);
-        console.log('  - Message content length:', requestBody.messages[0].content.length);
+        console.log('🤖 CHATGPT API: Using model:', requestBody.model);
 
         const response = await fetch('https://api.openai.com/v1/chat/completions', {
             method: 'POST',
@@ -197,45 +85,15 @@ Return ONLY this JSON:
 
             try {
                 const content = data.choices[0].message.content;
-                console.log('🤖 CHATGPT API: Message content extracted');
-                console.log('  - Content:', `"${content}"`);
-                console.log('  - Content length:', content.length);
-
                 // Extract JSON from the response
                 const jsonMatch = content.match(/\{[\s\S]*\}/);
-                console.log('🤖 CHATGPT API: Searching for JSON in response...');
-                console.log('  - JSON match found:', !!jsonMatch);
 
                 if (jsonMatch) {
-                    console.log('🤖 CHATGPT API: JSON extracted, attempting to parse...');
-                    console.log('  - JSON string:', jsonMatch[0]);
 
                     const parsed = JSON.parse(jsonMatch[0]);
-                    console.log('🤖 CHATGPT API: JSON parsed successfully');
-                    console.log('  - Parsed result:', JSON.stringify(parsed, null, 2));
-                    console.log('  - Has characters array:', !!parsed.characters);
-                    console.log('  - Characters count:', parsed.characters ? parsed.characters.length : 0);
 
                     if (parsed.characters && parsed.characters.length > 0) {
-                        console.log('  - Sample character:', parsed.characters[0]);
 
-                        // Post-process to fix common word grouping issues
-                        parsed.characters = fixWordGrouping(parsed.characters, chineseText);
-                        console.log('🤖 CHATGPT API: Word grouping fixed');
-                        console.log('  - Fixed characters:', JSON.stringify(parsed.characters.slice(0, 5), null, 2));
-
-                        // Validate character count
-                        const expectedChineseChars = chineseText.match(/[\u4e00-\u9fff]/g)?.length || 0;
-                        const receivedChars = parsed.characters.length;
-                        if (expectedChineseChars !== receivedChars) {
-                            console.warn(`⚠️ Character count mismatch! Expected ${expectedChineseChars} Chinese chars, got ${receivedChars} from ChatGPT`);
-                        }
-
-                        // Log first few character-pinyin mappings for debugging
-                        console.log('  - Character mappings (first 5):');
-                        parsed.characters.slice(0, 5).forEach(c => {
-                            console.log(`    ${c.character} → ${c.pinyin}`);
-                        });
                     }
 
                     return parsed;
@@ -293,6 +151,15 @@ async function processSubtitleWithChatGPT(subtitleText) {
         return;
     }
 
+    // Also check response cache
+    if (state.responseCache && state.responseCache[subtitleText]) {
+        console.log('📊 Found in response cache, using cached data');
+        state.chatgptBreakdown = state.responseCache[subtitleText];
+        state.lastProcessedText = subtitleText;
+        createSubtitlePopup(subtitleText);
+        return;
+    }
+
     // Get ChatGPT breakdown
     console.log('📊 Starting ChatGPT analysis...');
     const breakdown = await getChatGPTBreakdown(subtitleText);
@@ -304,7 +171,18 @@ async function processSubtitleWithChatGPT(subtitleText) {
     if (breakdown && breakdown.characters && breakdown.characters.length > 0) {
         state.chatgptBreakdown = breakdown;
         state.lastProcessedText = subtitleText; // Cache the processed text
-        console.log('✅ ChatGPT breakdown received successfully');
+
+        // Add to response cache (keep last 10 responses)
+        if (!state.responseCache) state.responseCache = {};
+        state.responseCache[subtitleText] = breakdown;
+
+        // Limit cache size
+        const cacheKeys = Object.keys(state.responseCache);
+        if (cacheKeys.length > 10) {
+            delete state.responseCache[cacheKeys[0]];
+        }
+
+        console.log('✅ ChatGPT breakdown received and cached');
         console.log('  - Sample character:', breakdown.characters[0]);
 
         // Update existing popup if open, otherwise create new one
@@ -336,14 +214,11 @@ function updatePopupWithChatGPTData(breakdown) {
             pinyinDiv.textContent = charData.pinyin;
         }
 
-        // Update character data attributes for hover
+        // Update character pinyin only (word analysis will happen on hover)
         const charDivs = state.currentPopup.querySelectorAll('[data-char]');
         if (charDivs[charDataIndex]) {
             const charDiv = charDivs[charDataIndex];
-            charDiv.dataset.wordGroup = charData.wordGroup || charData.character;
-            charDiv.dataset.definition = charData.definition || '';
             charDiv.dataset.pinyin = charData.pinyin || '';
-            charDiv.dataset.individualDefinition = charData.individualDefinition || '';
         }
 
         charDataIndex++;
@@ -367,9 +242,54 @@ function updatePopupWithChatGPTData(breakdown) {
 let hoverPopup = null;
 let highlightedChars = [];
 
+// Phase 2: Get word analysis on hover
+async function getWordAnalysis(character, fullText, charIndex) {
+    try {
+        const requestBody = {
+            model: 'gpt-3.5-turbo',
+            messages: [{
+                role: 'user',
+                content: `Text: ${fullText}
+Character at index ${charIndex}: "${character}"
+
+Check if this character is part of a multi-character word.
+If yes, return the complete word and definitions.
+
+Return JSON:
+{"isWord":true/false,"word":"complete word","wordDef":"meaning","chars":[{"char":"X","pinyin":"X","def":"individual meaning"}]}`
+            }],
+            max_tokens: 300,
+            temperature: 0
+        };
+
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${state.openaiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) return null;
+
+        const data = await response.json();
+        if (data.choices && data.choices[0]) {
+            const content = data.choices[0].message.content;
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+        }
+    } catch (error) {
+        console.error('Error getting word analysis:', error);
+    }
+    return null;
+}
+
 // Handle character hover - show definition popup
-function handleCharacterHover(event, charDiv, characterDataArray) {
-    console.log('🎯 Hover triggered on:', charDiv.dataset.char, charDiv.dataset);
+async function handleCharacterHover(event, charDiv, characterDataArray) {
+    console.log('🎯 Hover on:', charDiv.dataset.char);
 
     // Remove any existing hover popup
     if (hoverPopup) {
@@ -383,36 +303,54 @@ function handleCharacterHover(event, charDiv, characterDataArray) {
     });
     highlightedChars = [];
 
-    const wordGroup = charDiv.dataset.wordGroup;
-    const definition = charDiv.dataset.definition;
-    const charPinyin = charDiv.dataset.pinyin;
-    const char = charDiv.dataset.char;
-
-    console.log('🎯 Hover data:', { wordGroup, definition, charPinyin, char });
-
-    if (!wordGroup) {
-        console.log('⚠️ No wordGroup data, skipping hover popup');
-        return;
-    }
-
-    // Find all characters in the word group and highlight them
+    // Get full text and character index
+    const fullText = state.currentSubtitleText;
     const allCharDivs = document.querySelectorAll('#sublex-popup [data-char]');
+    const charIndex = Array.from(allCharDivs).indexOf(charDiv);
+
+    // Show loading indicator
+    charDiv.style.backgroundColor = 'rgba(255, 255, 0, 0.1)';
+
+    // Get word analysis from ChatGPT
+    const analysis = await getWordAnalysis(charDiv.dataset.char, fullText, charIndex);
+    console.log('🎯 Analysis:', analysis);
+
     const wordChars = [];
+    let wordDefinition = '';
 
-    console.log('🔍 Looking for word group:', wordGroup);
+    if (analysis && analysis.isWord && analysis.word) {
+        // Multi-character word found
+        wordDefinition = analysis.wordDef || '';
 
-    allCharDivs.forEach(div => {
-        console.log(`  Checking: ${div.dataset.char} with wordGroup: ${div.dataset.wordGroup}`);
-        if (div.dataset.wordGroup === wordGroup) {
-            div.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
-            highlightedChars.push(div);
-            wordChars.push({
-                char: div.dataset.char,
-                pinyin: div.dataset.pinyin,
-                individualDefinition: div.dataset.individualDefinition
-            });
+        // Find and highlight all characters in the word
+        const wordStart = fullText.indexOf(analysis.word);
+        if (wordStart !== -1) {
+            for (let i = 0; i < analysis.word.length; i++) {
+                const targetDiv = allCharDivs[wordStart + i];
+                if (targetDiv) {
+                    targetDiv.style.backgroundColor = 'rgba(255, 255, 0, 0.2)';
+                    highlightedChars.push(targetDiv);
+
+                    const charInfo = analysis.chars && analysis.chars[i];
+                    wordChars.push({
+                        char: targetDiv.dataset.char,
+                        pinyin: charInfo?.pinyin || targetDiv.dataset.pinyin || '',
+                        individualDefinition: charInfo?.def || ''
+                    });
+                }
+            }
         }
-    });
+    } else {
+        // Single character
+        charDiv.style.backgroundColor = 'rgba(255, 255, 0, 0.2)';
+        highlightedChars.push(charDiv);
+        wordChars.push({
+            char: charDiv.dataset.char,
+            pinyin: charDiv.dataset.pinyin || '',
+            individualDefinition: analysis?.chars?.[0]?.def || ''
+        });
+        wordDefinition = analysis?.chars?.[0]?.def || '';
+    }
 
     console.log('🎯 Found word characters:', wordChars);
 
@@ -439,22 +377,16 @@ function handleCharacterHover(event, charDiv, characterDataArray) {
     hoverPopup.style.top = `${rect.bottom + 10}px`;
 
     // Build popup content
-    // Check if this is truly a multi-character word (not just single character as its own wordGroup)
-    const isMultiCharWord = wordChars.length > 1 || (wordGroup && wordGroup.length > 1 && wordGroup !== char);
+    const isMultiCharWord = wordChars.length > 1;
+    const wordText = wordChars.map(c => c.char).join('');
+    const wordPinyin = wordChars.map(c => c.pinyin).join(' ');
 
-    console.log('🎯 Word analysis:', { isMultiCharWord, wordCharsLength: wordChars.length, wordGroup, char });
-
-    if (isMultiCharWord && wordChars.length > 1) {
+    if (isMultiCharWord) {
         // Multi-character word
-        const wordText = wordChars.map(c => c.char).join('');
-        const wordPinyin = wordChars.map(c => c.pinyin).join(' ');
-
-        // Use individual definitions already stored in the character data
-
         hoverPopup.innerHTML = `
             <div style="font-size: 18px; font-weight: bold; margin-bottom: 6px;">${wordText}</div>
             <div style="color: rgba(255, 255, 255, 0.7); margin-bottom: 8px;">${wordPinyin}</div>
-            <div style="margin-bottom: 10px;">${definition || 'No definition available'}</div>
+            <div style="margin-bottom: 10px;">${wordDefinition || 'Loading...'}</div>
             <div style="border-top: 1px solid rgba(255, 255, 255, 0.2); padding-top: 8px; margin-top: 8px;">
                 ${wordChars.map(c => `
                     <div style="margin-bottom: 4px; font-size: 13px;">
@@ -468,9 +400,9 @@ function handleCharacterHover(event, charDiv, characterDataArray) {
     } else {
         // Single character
         hoverPopup.innerHTML = `
-            <div style="font-size: 18px; font-weight: bold; margin-bottom: 6px;">${char}</div>
-            <div style="color: rgba(255, 255, 255, 0.7); margin-bottom: 8px;">${charPinyin}</div>
-            <div>${definition || 'No definition available'}</div>
+            <div style="font-size: 18px; font-weight: bold; margin-bottom: 6px;">${wordText}</div>
+            <div style="color: rgba(255, 255, 255, 0.7); margin-bottom: 8px;">${wordPinyin}</div>
+            <div>${wordDefinition || 'Loading...'}</div>
         `;
     }
 
