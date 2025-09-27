@@ -112,18 +112,22 @@ async function getChatGPTBreakdown(chineseText, retryCount = 0) {
             model: 'gpt-3.5-turbo',
             messages: [{
                 role: 'user',
-                content: `Analyze: ${chineseText}
+                content: `Analyze this Chinese text: "${chineseText}"
 
 CRITICAL RULES:
-1. Return pinyin for EACH character IN THE EXACT ORDER they appear
-2. Include ALL particles: 的(de), 了(le), 呢(ne), 吗(ma), 吧(ba), 啊(a), etc.
-3. Handle duplicates: If "你" appears twice, include it twice with correct pinyin each time
-4. Character-by-character: "工作" = two entries: {"character":"工","pinyin":"gōng"}, {"character":"作","pinyin":"zuò"}
+1. For "meaning": Translate the ENTIRE TEXT "${chineseText}" as a complete sentence/phrase
+   - Consider the full context and meaning of the whole text
+   - Do NOT just translate individual words or partial phrases
+   - Example: "行行行麻烦了 不客气" means "Okay okay okay, sorry for the trouble - You're welcome"
+2. Return pinyin for EACH character IN THE EXACT ORDER they appear
+3. Include ALL particles: 的(de), 了(le), 呢(ne), 吗(ma), 吧(ba), 啊(a), etc.
+4. Handle duplicates: If "你" appears twice, include it twice with correct pinyin each time
+5. Character-by-character: "工作" = two entries: {"character":"工","pinyin":"gōng"}, {"character":"作","pinyin":"zuò"}
 
 The text has these Chinese characters in order: ${(chineseText.match(/[\u4e00-\u9fff]/g) || []).join(', ')}
 
-Return JSON with EXACTLY ${chineseText.match(/[\u4e00-\u9fff]/g)?.length || 0} entries in this EXACT order:
-{"meaning":"English translation","characters":[{"character":"X","pinyin":"X"}...]}
+Return JSON with EXACTLY ${chineseText.match(/[\u4e00-\u9fff]/g)?.length || 0} character entries:
+{"meaning":"[FULL translation of '${chineseText}']","characters":[{"character":"X","pinyin":"X"}...]}
 
 MAINTAIN EXACT CHARACTER ORDER!`
             }],
@@ -1239,10 +1243,7 @@ function createSubtitlePopup(text) {
     contentContainer.appendChild(qaSection);
     popup.appendChild(contentContainer);
 
-    // Auto-focus the Q&A input after a small delay to ensure popup is rendered
-    setTimeout(() => {
-        qaInput.focus();
-    }, 100);
+    // Don't auto-focus - let user choose when to interact with Q&A
 
     // Close handlers - ESC key and video resume
     const closePopup = () => {
