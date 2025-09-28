@@ -861,7 +861,7 @@ function createSubtitlePopup(text) {
     popup.style.cssText = `
         position: fixed;
         left: 50%;
-        bottom: ${window.innerHeight - subtitleRect.top + 20}px;
+        bottom: ${window.innerHeight - subtitleRect.top + 100}px;
         transform: translateX(-50%);
         background: rgba(20, 20, 30, 0.95);
         border: 1px solid rgba(255, 255, 255, 0.2);
