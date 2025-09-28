@@ -542,12 +542,15 @@ async function getWordAnalysis(character, fullText, charIndex, abortSignal, retr
 Character at position ${charIndex}: "${character}"
 
 Analyze if this character is part of a multi-character word OR is a particle.
-If it's a particle (的,了,呢,吗,吧,啊,etc), provide its pinyin and grammatical function.
 
-Return ONLY valid JSON:
-{"isWord":true/false,"word":"complete word","wordDef":"meaning","chars":[{"char":"X","pinyin":"X","def":"meaning/function"}]}
+CRITICAL: If it's part of a word, return ALL characters in the word with their individual meanings.
+Example: If "代" is part of "交代", return BOTH characters:
+{"isWord":true,"word":"交代","wordDef":"to explain","chars":[{"char":"交","pinyin":"jiāo","def":"to hand over"},{"char":"代","pinyin":"dài","def":"to substitute"}]}
 
-For particles like 的, return: {"isWord":false,"chars":[{"char":"的","pinyin":"de","def":"possessive particle"}]}`
+For particles (的,了,呢,吗,吧,啊,etc), return:
+{"isWord":false,"chars":[{"char":"的","pinyin":"de","def":"possessive particle"}]}
+
+Return ONLY valid JSON with ALL characters in the word.`
             }],
             max_tokens: 300,
             temperature: 0
@@ -653,6 +656,14 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
     }
 
     console.log('🎯 Analysis:', analysis);
+    console.log('🔍 HOVER DEBUG - Full analysis:', {
+        hoveredChar: charDiv.dataset.char,
+        charIndex: charIndex,
+        isWord: analysis?.isWord,
+        word: analysis?.word,
+        chars: analysis?.chars,
+        wordDef: analysis?.wordDef
+    });
 
     const wordChars = [];
     let wordDefinition = '';
@@ -660,6 +671,9 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
     if (analysis && analysis.isWord && analysis.word) {
         // Multi-character word found
         wordDefinition = analysis.wordDef || '';
+
+        console.log('🔍 HOVER DEBUG - Multi-char word detected:', analysis.word);
+        console.log('🔍 HOVER DEBUG - Analysis chars array:', JSON.stringify(analysis.chars));
 
         // Use the character index to find the correct word position
         // The word should include the hovered character at charIndex
@@ -677,30 +691,47 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         const chineseCharIndex = chineseCharDivs.indexOf(charDiv);
 
         // Look for the word starting at or before the current character
+        console.log(`🔍 HOVER DEBUG - Searching for word "${analysis.word}" containing char at index ${chineseCharIndex}`);
         for (let startPos = Math.max(0, chineseCharIndex - analysis.word.length + 1); startPos <= chineseCharIndex; startPos++) {
             let matches = true;
+            console.log(`🔍 HOVER DEBUG - Checking start position ${startPos}`);
             for (let i = 0; i < analysis.word.length && startPos + i < chineseCharDivs.length; i++) {
-                if (chineseCharDivs[startPos + i].dataset.char !== analysis.word[i]) {
+                const divChar = chineseCharDivs[startPos + i].dataset.char;
+                const wordChar = analysis.word[i];
+                console.log(`🔍   Comparing pos ${startPos + i}: div="${divChar}" vs word[${i}]="${wordChar}"`);
+                if (divChar !== wordChar) {
                     matches = false;
                     break;
                 }
             }
             if (matches && startPos <= chineseCharIndex && startPos + analysis.word.length > chineseCharIndex) {
                 wordStartIndex = startPos;
+                console.log('🔍 HOVER DEBUG - Found word at position:', wordStartIndex);
                 break;
             }
         }
 
         if (wordStartIndex !== -1) {
+            console.log('🔍 HOVER DEBUG - Building wordChars from position', wordStartIndex);
             for (let i = 0; i < analysis.word.length; i++) {
                 const targetDiv = chineseCharDivs[wordStartIndex + i];
                 if (targetDiv) {
                     const charInfo = analysis.chars && analysis.chars[i];
-                    wordChars.push({
-                        char: targetDiv.dataset.char,
+                    const charToAdd = {
+                        // Use the character from the analysis.chars array, or from analysis.word, or fallback to DOM
+                        char: charInfo?.char || analysis.word[i] || targetDiv.dataset.char,
                         pinyin: charInfo?.pinyin || targetDiv.dataset.pinyin || '',
                         individualDefinition: charInfo?.def || ''
+                    };
+                    console.log(`🔍 HOVER DEBUG - Adding char ${i}:`, {
+                        charInfo: charInfo,
+                        fromCharInfo: charInfo?.char,
+                        fromWord: analysis.word[i],
+                        fromDOM: targetDiv.dataset.char,
+                        final: charToAdd.char,
+                        pinyin: charToAdd.pinyin
                     });
+                    wordChars.push(charToAdd);
                 }
             }
         } else {
@@ -722,7 +753,8 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         wordDefinition = analysis?.chars?.[0]?.def || '';
     }
 
-    console.log('🎯 Found word characters:', wordChars);
+    console.log('🎯 HOVER DEBUG - Final wordChars array:', JSON.stringify(wordChars));
+    console.log('🎯 HOVER DEBUG - Word definition:', wordDefinition);
 
     // Update existing popup content (remove "Processing..." and show results)
     if (!hoverPopup) {
