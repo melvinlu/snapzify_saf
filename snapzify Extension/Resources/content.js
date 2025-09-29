@@ -20,7 +20,9 @@ const state = {
     openaiKey: null,
     chatgptBreakdown: null,
     responseCache: {}, // Cache API responses for speed
-    conversationHistory: [] // Store conversation context for Q&A
+    conversationHistory: [], // Store conversation context for Q&A
+    subtitleHistory: [], // Track subtitle history for navigation
+    currentSubtitleStartTime: null // Track when current subtitle started
 };
 
 // Helper function to get the correct container for popups (handles fullscreen)
@@ -1263,13 +1265,63 @@ function createSubtitlePopup(text) {
         qaInput.value = '';
     };
 
+    // Create replay button (same style as Ask button)
+    const replayButton = document.createElement('button');
+    replayButton.innerHTML = '↻';  // Replay icon
+    replayButton.title = 'Replay from start';
+    replayButton.style.cssText = `
+        padding: 8px 15px;
+        background: rgba(255, 255, 255, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+
+    replayButton.onmouseover = () => {
+        replayButton.style.background = 'rgba(255, 255, 255, 0.2)';
+        replayButton.style.borderColor = 'rgba(255, 255, 255, 0.3)';
+    };
+    replayButton.onmouseout = () => {
+        replayButton.style.background = 'rgba(255, 255, 255, 0.15)';
+        replayButton.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+    };
+
+    replayButton.onclick = () => {
+        const video = document.querySelector('video');
+        if (!video) return;
+
+        let targetTime = null;
+
+        if (state.currentSubtitleStartTime) {
+            // Go to exact start of current subtitle
+            targetTime = state.currentSubtitleStartTime;
+            console.log('↻ Replaying from subtitle start:', targetTime);
+        } else {
+            // Fallback: go back 3 seconds (typical subtitle duration)
+            targetTime = Math.max(0, video.currentTime - 3);
+            console.log('↻ Going back 3 seconds (no exact timestamp available)');
+        }
+
+        if (targetTime !== null) {
+            video.currentTime = targetTime;
+            // Resume playback immediately to replay the audio
+            video.play();
+            // Let the video continue playing - user can pause manually if needed
+        }
+    };
+
     qaSendBtn.onclick = submitQuestion;
     qaInput.onkeypress = (e) => {
         if (e.key === 'Enter') submitQuestion();
     };
 
+    // Add all elements to the input container
     qaInputContainer.appendChild(qaInput);
     qaInputContainer.appendChild(qaSendBtn);
+    qaInputContainer.appendChild(replayButton);
     qaSection.appendChild(qaInputContainer);
 
     contentContainer.appendChild(qaSection);
@@ -1334,6 +1386,7 @@ function createSubtitlePopup(text) {
 // Check for Chinese subtitles and update current text
 function checkForChineseSubtitles() {
     const subtitleElement = document.querySelector('.vjs-text-track-cue');
+    const video = document.querySelector('video');
 
     if (!subtitleElement) {
         if (state.currentSubtitleText !== null) {
@@ -1350,8 +1403,24 @@ function checkForChineseSubtitles() {
     if (/[\u4e00-\u9fff]/.test(text)) {
         // Only log if this is a new/different subtitle
         if (state.currentSubtitleText !== text) {
+            // Save previous subtitle to history before updating
+            if (state.currentSubtitleText && video) {
+                const lastEntry = state.subtitleHistory[state.subtitleHistory.length - 1];
+                if (!lastEntry || lastEntry.text !== state.currentSubtitleText) {
+                    state.subtitleHistory.push({
+                        text: state.currentSubtitleText,
+                        timestamp: state.currentSubtitleStartTime || video.currentTime - 2
+                    });
+                    // Keep only last 10 subtitles
+                    if (state.subtitleHistory.length > 10) {
+                        state.subtitleHistory.shift();
+                    }
+                    console.log('🔙 Added to subtitle history:', state.currentSubtitleText);
+                }
+            }
             state.currentSubtitleText = text;
             state.subtitleElement = subtitleElement;
+            state.currentSubtitleStartTime = video ? video.currentTime : null;
             console.log('📝 SUBTITLE: Chinese subtitle detected:', text);
         }
     } else {
@@ -1468,18 +1537,8 @@ function setupSubtitleMonitoring() {
     // Use MutationObserver to watch for subtitle changes
     const observer = new MutationObserver(() => {
         checkForChineseSubtitles();
-
-        // If video is paused and we have new Chinese text, process it (don't create popup directly)
-        const video = document.querySelector('video');
-        if (video && video.paused && state.currentSubtitleText && !state.isPopupOpen) {
-            // Let processSubtitleWithChatGPT handle popup creation and ChatGPT processing
-            if (state.openaiKey) {
-                processSubtitleWithChatGPT(state.currentSubtitleText);
-            } else {
-                // Only create popup directly if no API key (for key input)
-                createSubtitlePopup(state.currentSubtitleText);
-            }
-        }
+        // Don't create popup here - let the pause handler deal with it
+        // This observer just tracks subtitle changes
     });
 
     // Wait for video player to load
