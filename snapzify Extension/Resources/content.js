@@ -39,7 +39,8 @@ const state = {
     lastKnownSubtitleTime: null, // When we last saw a Chinese subtitle
     currentVideoTitle: null, // Store the current video/show title
     qaInputFocusInterval: null, // Track focus maintenance interval
-    savedPopupPosition: null, // Store user's preferred popup position
+    savedPopupSettings: null, // Store user's preferred popup position and dimensions
+    resizeSaveTimeout: null, // Debounce resize saves
     pinyinPermanentlyVisible: false, // Track if pinyin should stay visible for this popup
     meaningPermanentlyVisible: false, // Track if meaning should stay visible for this popup
     qaExpanded: false // Track if Q&A section is expanded
@@ -186,8 +187,8 @@ function updatePopupWithPartialData(partialData) {
     }
 }
 
-// Resume video and clean up all UI elements
-function resumeVideo() {
+// Clean up UI elements
+function cleanupUI() {
     // Clear any hover popups
     if (hoverPopup) {
         hoverPopup.remove();
@@ -199,12 +200,6 @@ function resumeVideo() {
         el.style.backgroundColor = 'transparent';
     });
     highlightedChars = [];
-
-    // Resume video playback
-    const video = document.querySelector('video');
-    if (video && video.paused && state.wasPlayingBeforePopup) {
-        video.play();
-    }
 }
 
 
@@ -694,19 +689,36 @@ async function getWordAnalysis(character, fullText, charIndex, abortSignal, retr
             messages: [{
                 role: 'user',
                 content: `Context: From video "${videoTitle}"
-Text: ${fullText}
+Full text: "${fullText}"
 Character at position ${charIndex}: "${character}"
 
-Analyze if this character is part of a multi-character word OR is a particle.
+IMPORTANT TASK: Find the COMPLETE multi-character compound word that contains "${character}".
 
-CRITICAL: If it's part of a word, return ALL characters in the word with their individual meanings.
-Example: If "代" is part of "交代", return BOTH characters:
-{"isWord":true,"word":"交代","wordDef":"to explain","chars":[{"char":"交","pinyin":"jiāo","def":"to hand over"},{"char":"代","pinyin":"dài","def":"to substitute"}]}
+1. FIRST: Identify if "${character}" is part of a compound word by looking at surrounding characters
+2. Common compound words to check:
+   - 2-character: 大学, 工作, 朋友, 老师, 学生, 问题, 时间, 地方, 财富, 帮助
+   - 3-character: 大学生, 没问题, 不过来
+   - 4-character: 一路平安, 四平八稳
 
-For particles (的,了,呢,吗,吧,啊,etc), return:
-{"isWord":false,"chars":[{"char":"的","pinyin":"de","def":"possessive particle"}]}
+3. Look at 3 characters before AND 3 characters after "${character}" to find word boundaries
 
-Return ONLY valid JSON with ALL characters in the word.`
+4. Consider these patterns:
+   - Verb+Object compounds: 吃饭, 说话, 开车
+   - Modifier+Noun: 大学, 红色, 好人
+   - Common phrases: 不过, 可是, 因为, 所以
+
+EXAMPLES:
+- If "富" appears in "财富排名", return word="财富" (wealth)
+- If "助" appears in "帮助他", return word="帮助" (help)
+- If "名" appears in "排名前十", return word="排名" (ranking)
+
+For multi-character compound words, return:
+{"isWord":true,"word":"[complete compound word]","wordDef":"[translation]","chars":[{"char":"[each char]","pinyin":"[pinyin]","def":"[individual meaning]"}...]}
+
+For single characters (including particles 的,了,呢,吗,吧,啊), return:
+{"isWord":false,"chars":[{"char":"${character}","pinyin":"[pinyin]","def":"[meaning]"}]}
+
+Return ONLY valid JSON. DO NOT return just the single character if it's part of a compound word!`
             }],
             max_tokens: 300,
             temperature: 0
@@ -1060,16 +1072,16 @@ function createSubtitlePopup(text) {
         console.log('📍 No subtitle element, using default position');
     }
 
-    // Load saved position from localStorage
-    if (!state.savedPopupPosition) {
+    // Load saved settings from localStorage
+    if (!state.savedPopupSettings) {
         try {
-            const saved = localStorage.getItem('sublex-popup-position');
+            const saved = localStorage.getItem('sublex-popup-settings');
             if (saved) {
-                state.savedPopupPosition = JSON.parse(saved);
-                console.log('📍 Loaded saved popup position:', state.savedPopupPosition);
+                state.savedPopupSettings = JSON.parse(saved);
+                console.log('📍 Loaded saved popup settings:', state.savedPopupSettings);
             }
         } catch (e) {
-            console.error('Failed to load saved position:', e);
+            console.error('Failed to load saved settings:', e);
         }
     }
 
@@ -1080,22 +1092,26 @@ function createSubtitlePopup(text) {
     // Netflix may need higher z-index and different positioning
     const zIndex = platform.isNetflix ? '2147483647' : '2147483650';
 
-    // Use saved position if available, otherwise use defaults
+    // Use saved settings if available, otherwise use defaults
     let popupStyles = '';
-    if (state.savedPopupPosition) {
-        // Use saved position
+    if (state.savedPopupSettings) {
+        // Use saved settings
         popupStyles = `
             position: fixed;
-            top: ${state.savedPopupPosition.top}px;
-            left: ${state.savedPopupPosition.left}px;
-            background: rgba(20, 20, 30, 0.98);
+            top: ${state.savedPopupSettings.top}px;
+            left: ${state.savedPopupSettings.left}px;
+            width: ${state.savedPopupSettings.width ? state.savedPopupSettings.width + 'px' : 'auto'};
+            background: rgb(20, 20, 30);
             border: 2px solid rgba(255, 255, 255, 0.4);
             border-radius: 12px;
-            padding: 15px;
-            padding-top: 25px;
+            padding: 10px;
+            padding-top: 15px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.9);
-            min-width: 400px;
-            max-width: 90vw;
+            width: fit-content;
+            min-width: 200px;
+            max-width: 600px;
+            resize: both;
+            overflow: visible;
             color: white;
             z-index: ${zIndex};
             pointer-events: auto;
@@ -1111,14 +1127,17 @@ function createSubtitlePopup(text) {
             top: 82%;
             left: 50%;
             transform: translate(-50%, -50%);
-            background: rgba(20, 20, 30, 0.98);
+            background: rgb(20, 20, 30);
             border: 2px solid rgba(255, 255, 255, 0.4);
             border-radius: 12px;
-            padding: 15px;
-            padding-top: 25px;
+            padding: 10px;
+            padding-top: 15px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.9);
-            min-width: 400px;
-            max-width: 90vw;
+            width: fit-content;
+            min-width: 200px;
+            max-width: 600px;
+            resize: both;
+            overflow: visible;
             color: white;
             z-index: 2147483647;
             pointer-events: auto;
@@ -1135,14 +1154,17 @@ function createSubtitlePopup(text) {
             left: 50%;
             bottom: ${window.innerHeight - subtitleRect.top + 100}px;
             transform: translateX(-50%);
-            background: rgba(20, 20, 30, 0.95);
+            background: rgb(20, 20, 30);
             border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 12px;
-            padding: 15px;
-            padding-top: 25px;
+            padding: 10px;
+            padding-top: 15px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.8);
-            min-width: 400px;
-            max-width: 90vw;
+            width: fit-content;
+            min-width: 200px;
+            max-width: 600px;
+            resize: both;
+            overflow: visible;
             color: white;
             z-index: ${zIndex};
             pointer-events: auto;
@@ -1217,25 +1239,54 @@ function createSubtitlePopup(text) {
         isDragging = false;
         popup.style.cursor = 'move';
 
-        // Save the new position
+        // Save the new position and dimensions
         const rect = popup.getBoundingClientRect();
-        state.savedPopupPosition = {
+        state.savedPopupSettings = {
             top: rect.top,
-            left: rect.left
+            left: rect.left,
+            width: rect.width,
+            height: rect.height
         };
 
         // Save to localStorage
         try {
-            localStorage.setItem('sublex-popup-position', JSON.stringify(state.savedPopupPosition));
-            console.log('💾 Saved popup position:', state.savedPopupPosition);
+            localStorage.setItem('sublex-popup-settings', JSON.stringify(state.savedPopupSettings));
+            console.log('💾 Saved popup settings:', state.savedPopupSettings);
         } catch (e) {
-            console.error('Failed to save position:', e);
+            console.error('Failed to save settings:', e);
         }
     };
 
     popup.addEventListener('mousedown', startDrag);
     document.addEventListener('mousemove', doDrag);
     document.addEventListener('mouseup', endDrag);
+
+    // Add resize observer to save dimensions when resized
+    const resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+            const rect = entry.target.getBoundingClientRect();
+            // Only save if dimensions actually changed and popup is stable
+            if (rect.width > 50 && rect.height > 50) {
+                state.savedPopupSettings = {
+                    top: rect.top,
+                    left: rect.left,
+                    width: rect.width,
+                    height: rect.height
+                };
+                // Debounced save to localStorage
+                clearTimeout(state.resizeSaveTimeout);
+                state.resizeSaveTimeout = setTimeout(() => {
+                    try {
+                        localStorage.setItem('sublex-popup-settings', JSON.stringify(state.savedPopupSettings));
+                        console.log('💾 Saved resized dimensions:', state.savedPopupSettings);
+                    } catch (e) {
+                        console.error('Failed to save settings:', e);
+                    }
+                }, 500);
+            }
+        }
+    });
+    resizeObserver.observe(popup);
 
 
     // API Key input section (hidden by default)
@@ -1273,7 +1324,7 @@ function createSubtitlePopup(text) {
     const openaiSaveBtn = document.createElement('button');
     openaiSaveBtn.textContent = 'Save';
     openaiSaveBtn.style.cssText = `
-        padding: 8px 15px;
+        padding: 8px 12px;
         background: #4CAF50;
         border: none;
         border-radius: 4px;
@@ -1310,12 +1361,21 @@ function createSubtitlePopup(text) {
     // Use subtitle text (keep punctuation)
     const cleanedText = text.trim();
 
-    // Create main content container
+    // Create main content container with horizontal layout
     const contentContainer = document.createElement('div');
     contentContainer.style.cssText = `
         display: flex;
         flex-direction: column;
         gap: 0px;
+    `;
+
+    // Create wrapper for text and buttons
+    const textAndButtonsWrapper = document.createElement('div');
+    textAndButtonsWrapper.style.cssText = `
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin-bottom: 2px;
     `;
 
     // Create character grid with pinyin - stable layout
@@ -1327,7 +1387,7 @@ function createSubtitlePopup(text) {
         align-items: start;
         gap: 1px;
         flex-wrap: wrap;
-        margin-bottom: 2px;
+        flex: 1;
     `;
 
     // Split text into characters and add pinyin if available
@@ -1459,15 +1519,16 @@ function createSubtitlePopup(text) {
         }
     });
 
-    contentContainer.appendChild(chineseTextContainer);
+    // Add Chinese text to wrapper
+    textAndButtonsWrapper.appendChild(chineseTextContainer);
 
     // Second section: ChatGPT breakdown
     const breakdownContainer = document.createElement('div');
     breakdownContainer.style.cssText = `
         color: rgba(255, 255, 255, 0.9);
         font-size: 14px;
-        line-height: 1.4;
-        margin-bottom: 4px;
+        line-height: 1.3;
+        margin-top: 4px;
     `;
 
     if (state.chatgptBreakdown) {
@@ -1477,7 +1538,7 @@ function createSubtitlePopup(text) {
         if (state.chatgptBreakdown.meaning) {
             const meaningDiv = document.createElement('div');
             meaningDiv.style.cssText = `
-                padding: 4px 8px;
+                padding: 3px 6px;
                 background: rgba(255, 255, 255, 0.05);
                 border-radius: 6px;
                 line-height: 1.3;
@@ -1495,7 +1556,7 @@ function createSubtitlePopup(text) {
         const loadingDiv = document.createElement('div');
         loadingDiv.style.cssText = `
             text-align: center;
-            padding: 4px 8px;
+            padding: 3px 6px;
             color: rgba(255, 255, 255, 0.6);
             font-style: italic;
             opacity: 0;
@@ -1509,51 +1570,59 @@ function createSubtitlePopup(text) {
 
     contentContainer.appendChild(breakdownContainer);
 
-    // Add toggle buttons section before Q&A
+    // Add toggle buttons section to the right of Chinese text
     const toggleButtonsSection = document.createElement('div');
     toggleButtonsSection.style.cssText = `
         display: flex;
-        gap: 8px;
-        margin-bottom: 0px;
+        flex-direction: row;
+        gap: 4px;
+        flex-shrink: 0;
     `;
 
-    // Pinyin toggle button
+    // Pinyin toggle button (compact)
     const pinyinToggle = document.createElement('button');
-    pinyinToggle.textContent = 'Pinyin';
+    pinyinToggle.textContent = 'P';
+    pinyinToggle.title = 'Show/Hide Pinyin';
     pinyinToggle.style.cssText = `
-        flex: 3;
-        padding: 6px;
+        width: 28px;
+        height: 28px;
+        padding: 0;
         background: rgba(255, 255, 255, 0.1);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
         color: rgba(255, 255, 255, 0.9);
         font-size: 12px;
+        font-weight: bold;
         cursor: pointer;
         transition: all 0.2s;
     `;
 
-    // Meaning toggle button
+    // Meaning toggle button (compact)
     const meaningToggle = document.createElement('button');
-    meaningToggle.textContent = 'Meaning';
+    meaningToggle.textContent = 'M';
+    meaningToggle.title = 'Show/Hide Meaning';
     meaningToggle.style.cssText = `
-        flex: 3;
-        padding: 6px;
+        width: 28px;
+        height: 28px;
+        padding: 0;
         background: rgba(255, 255, 255, 0.1);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
         color: rgba(255, 255, 255, 0.9);
         font-size: 12px;
+        font-weight: bold;
         cursor: pointer;
         transition: all 0.2s;
     `;
 
-    // Q&A dropdown toggle button
+    // Q&A side panel toggle button (compact)
     const qaDropdown = document.createElement('button');
-    qaDropdown.innerHTML = '▼';
+    qaDropdown.innerHTML = '▶';
     qaDropdown.title = 'Show Q&A';
     qaDropdown.style.cssText = `
-        flex: 1;
-        padding: 6px;
+        width: 28px;
+        height: 28px;
+        padding: 0;
         background: rgba(255, 255, 255, 0.1);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
@@ -1604,7 +1673,6 @@ function createSubtitlePopup(text) {
     pinyinToggle.addEventListener('click', () => {
         state.pinyinPermanentlyVisible = !state.pinyinPermanentlyVisible;
         setPinyinVisibility(state.pinyinPermanentlyVisible);
-        pinyinToggle.textContent = state.pinyinPermanentlyVisible ? 'Hide' : 'Pinyin';
         pinyinToggle.style.background = state.pinyinPermanentlyVisible ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
     });
 
@@ -1626,37 +1694,90 @@ function createSubtitlePopup(text) {
     meaningToggle.addEventListener('click', () => {
         state.meaningPermanentlyVisible = !state.meaningPermanentlyVisible;
         setMeaningVisibility(state.meaningPermanentlyVisible);
-        meaningToggle.textContent = state.meaningPermanentlyVisible ? 'Hide' : 'Meaning';
         meaningToggle.style.background = state.meaningPermanentlyVisible ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
     });
 
-    // Q&A dropdown handlers
+    // Q&A side panel handlers
     const toggleQASection = (expand) => {
         state.qaExpanded = expand;
-        const qa = popup.querySelector('#qa-section');
-        if (qa) {
-            if (expand) {
-                qa.style.display = 'block';
+        let qaPanel = document.getElementById('qa-side-panel');
+
+        if (expand) {
+            // Create or show the side panel
+            if (!qaPanel) {
+                const popupRect = popup.getBoundingClientRect();
+                qaPanel = document.createElement('div');
+                qaPanel.id = 'qa-side-panel';
+                const panelHeight = 250;
+                // With box-sizing: border-box, height includes padding and border
+                // So we just need to align the bottom edges
+                const panelTop = popupRect.bottom - panelHeight;
+                qaPanel.style.cssText = `
+                    position: fixed;
+                    top: ${panelTop}px;
+                    left: ${popupRect.right + 10}px;
+                    width: 350px;
+                    height: ${panelHeight}px;
+                    background: rgb(20, 20, 30);
+                    border: 2px solid rgba(255, 255, 255, 0.4);
+                    border-radius: 12px;
+                    padding: 10px;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.9);
+                    z-index: ${popup.style.zIndex};
+                    display: flex;
+                    flex-direction: column;
+                    opacity: 0;
+                    transition: opacity 0.3s;
+                    box-sizing: border-box;
+                `;
+
+                // Create Q&A content for side panel
+                const qaContent = createQAContent();
+                qaPanel.appendChild(qaContent);
+                document.body.appendChild(qaPanel);
+
+                // Fade in
                 setTimeout(() => {
-                    qa.style.opacity = '1';
-                    // Auto-focus the input
-                    const input = qa.querySelector('#qa-input');
+                    qaPanel.style.opacity = '1';
+                    const input = qaPanel.querySelector('#qa-input');
                     if (input) {
                         input.focus();
                     }
                 }, 10);
-                qaDropdown.innerHTML = '▲';
-                qaDropdown.title = 'Hide Q&A';
-                qaDropdown.style.background = 'rgba(100, 200, 100, 0.3)';
             } else {
-                qa.style.opacity = '0';
+                // Update position if popup moved
+                const popupRect = popup.getBoundingClientRect();
+                // Get the actual rendered height of the panel
+                const panelRect = qaPanel.getBoundingClientRect();
+                // Align bottoms exactly
+                const panelTop = popupRect.bottom - panelRect.height;
+                qaPanel.style.top = `${panelTop}px`;
+                qaPanel.style.left = `${popupRect.right + 10}px`;
+                qaPanel.style.display = 'flex';
                 setTimeout(() => {
-                    qa.style.display = 'none';
-                }, 300);
-                qaDropdown.innerHTML = '▼';
-                qaDropdown.title = 'Show Q&A';
-                qaDropdown.style.background = 'rgba(255, 255, 255, 0.1)';
+                    qaPanel.style.opacity = '1';
+                    const input = qaPanel.querySelector('#qa-input');
+                    if (input) {
+                        input.focus();
+                    }
+                }, 10);
             }
+
+            qaDropdown.innerHTML = '◀';
+            qaDropdown.title = 'Hide Q&A';
+            qaDropdown.style.background = 'rgba(100, 200, 100, 0.3)';
+        } else {
+            // Hide the side panel
+            if (qaPanel) {
+                qaPanel.style.opacity = '0';
+                setTimeout(() => {
+                    qaPanel.style.display = 'none';
+                }, 300);
+            }
+
+            qaDropdown.innerHTML = '▶';
+            qaDropdown.title = 'Show Q&A';
+            qaDropdown.style.background = 'rgba(255, 255, 255, 0.1)';
         }
     };
 
@@ -1677,39 +1798,45 @@ function createSubtitlePopup(text) {
     toggleButtonsSection.appendChild(pinyinToggle);
     toggleButtonsSection.appendChild(meaningToggle);
     toggleButtonsSection.appendChild(qaDropdown);
-    contentContainer.appendChild(toggleButtonsSection);
 
-    // Add Q&A section
-    const qaSection = document.createElement('div');
-    qaSection.id = 'qa-section';
-    qaSection.style.cssText = `
-        margin-top: 0px;
-        padding: 8px;
-        background: rgba(255, 255, 255, 0.05);
-        border-radius: 8px;
-        display: none;
-        opacity: 0;
-        transition: opacity 0.3s;
-    `;
+    // Add buttons to wrapper
+    textAndButtonsWrapper.appendChild(toggleButtonsSection);
 
-    // Q&A response area
-    const qaResponseArea = document.createElement('div');
-    qaResponseArea.id = 'qa-response';
-    qaResponseArea.style.cssText = `
-        margin-bottom: 10px;
-        max-height: 150px;
-        overflow-y: auto;
-        display: none;
-    `;
-    qaSection.appendChild(qaResponseArea);
+    // Add wrapper to content container
+    contentContainer.appendChild(textAndButtonsWrapper);
 
-    // Q&A input container
-    const qaInputContainer = document.createElement('div');
-    qaInputContainer.style.cssText = `
-        display: flex;
-        gap: 8px;
-        align-items: center;
-    `;
+    // Helper function to create Q&A content
+    const createQAContent = () => {
+        const container = document.createElement('div');
+        container.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            gap: 10px;
+        `;
+
+        // Q&A response area
+        const qaResponseArea = document.createElement('div');
+        qaResponseArea.id = 'qa-response';
+        qaResponseArea.style.cssText = `
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 14px;
+            line-height: 1.5;
+        `;
+        container.appendChild(qaResponseArea);
+
+        // Q&A input container
+        const qaInputContainer = document.createElement('div');
+        qaInputContainer.style.cssText = `
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        `;
 
     // Q&A input field
     const qaInput = document.createElement('input');
@@ -1786,7 +1913,7 @@ function createSubtitlePopup(text) {
     const qaSendBtn = document.createElement('button');
     qaSendBtn.textContent = 'Ask';
     qaSendBtn.style.cssText = `
-        padding: 8px 15px;
+        padding: 8px 12px;
         background: rgba(255, 255, 255, 0.15);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
@@ -1837,9 +1964,9 @@ function createSubtitlePopup(text) {
     // Create replay button (same style as Ask button)
     const replayButton = document.createElement('button');
     replayButton.innerHTML = '↻';  // Replay icon
-    replayButton.title = 'Replay from start';
+    replayButton.title = 'Rewind 10 seconds';
     replayButton.style.cssText = `
-        padding: 8px 15px;
+        padding: 8px 12px;
         background: rgba(255, 255, 255, 0.15);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
@@ -1884,10 +2011,10 @@ function createSubtitlePopup(text) {
 
     // Create API key button (settings icon)
     const keyButton = document.createElement('button');
-    keyButton.innerHTML = '<span style="font-size: 16px;">⚙</span>';  // Settings/gear icon (larger)
+    keyButton.innerHTML = '⚙';  // Settings/gear icon
     keyButton.title = state.openaiKey ? 'Update API Key' : 'Set API Key';
     keyButton.style.cssText = `
-        padding: 8px 15px;
+        padding: 8px 12px;
         background: rgba(255, 255, 255, 0.15);
         border: 1px solid rgba(255, 255, 255, 0.2);
         border-radius: 4px;
@@ -1929,11 +2056,11 @@ function createSubtitlePopup(text) {
     // Add all elements to the input container
     qaInputContainer.appendChild(qaInput);
     qaInputContainer.appendChild(qaSendBtn);
-    qaInputContainer.appendChild(replayButton);
+    // qaInputContainer.appendChild(replayButton);  // Rewind button commented out for now
     qaInputContainer.appendChild(keyButton);
-    qaSection.appendChild(qaInputContainer);
-
-    contentContainer.appendChild(qaSection);
+        container.appendChild(qaInputContainer);
+        return container;
+    };
     popup.appendChild(contentContainer);
 
     // Don't auto-focus - let user choose when to interact with Q&A
@@ -1950,6 +2077,12 @@ function createSubtitlePopup(text) {
         if (state.qaInputFocusInterval) {
             clearInterval(state.qaInputFocusInterval);
             state.qaInputFocusInterval = null;
+        }
+
+        // Remove Q&A side panel if it exists
+        const qaPanel = document.getElementById('qa-side-panel');
+        if (qaPanel) {
+            qaPanel.remove();
         }
 
         // Clear conversation history when closing
@@ -1985,7 +2118,7 @@ function createSubtitlePopup(text) {
             state.netflixPolling.start();
         }
 
-        resumeVideo();
+        cleanupUI();
         console.log('✅ All popups closed, state reset');
     };
 
@@ -2107,6 +2240,7 @@ function createSubtitlePopup(text) {
 
 // Check for Chinese subtitles and update current text
 function checkForChineseSubtitles() {
+    const previousText = state.currentSubtitleText;
     let subtitleElement = null;
 
     if (platform.isViki) {
@@ -2186,6 +2320,22 @@ function checkForChineseSubtitles() {
             state.lastKnownSubtitleTime = Date.now();
 
             console.log('📝 SUBTITLE: Chinese subtitle detected:', text);
+
+            // Automatically show popup when Chinese text appears
+            if (!state.isPopupOpen) {
+                console.log('🎯 Chinese text detected - showing popup automatically');
+                console.log('🎯 OpenAI key available:', !!state.openaiKey);
+                // Always process with ChatGPT first (it will create popup too)
+                processSubtitleWithChatGPT(text);
+            } else if (previousText !== text) {
+                // Text changed, update the existing popup
+                console.log('📝 SUBTITLE: Text changed, updating popup');
+                // Clear old data and reprocess
+                state.chatgptBreakdown = null;
+                state.lastProcessedText = '';
+                // Always process with ChatGPT (it handles popup updates)
+                processSubtitleWithChatGPT(text);
+            }
         }
     } else {
         if (state.currentSubtitleText !== null) {
@@ -2201,6 +2351,18 @@ function checkForChineseSubtitles() {
             state.currentSubtitleText = null;
             state.subtitleElement = null;
             console.log('📝 SUBTITLE: Non-Chinese subtitle, cleared current text');
+
+            // Auto-pause the video when Chinese subtitle disappears
+            if (state.isPopupOpen && state.currentPopup) {
+                const video = document.querySelector('video');
+                if (video && !video.paused) {
+                    video.pause();
+                    console.log('⏸️ Auto-paused video for subtitle review');
+                }
+
+                // Keep popup open for review (don't close it)
+                console.log('🎯 Chinese text gone - keeping popup open for review');
+            }
         }
     }
 }
@@ -2256,6 +2418,27 @@ function setupVideoMonitoring() {
                         } else {
                             // Video was just resumed
                             console.log('🎬 Netflix video RESUMED (detected via polling)');
+
+                            // Close popup when video resumes
+                            if (state.isPopupOpen && state.currentPopup) {
+                                console.log('🎬 Closing popup on Netflix resume');
+
+                                // Also close Q&A panel if it's open
+                                const qaPanel = document.getElementById('qa-side-panel');
+                                if (qaPanel) {
+                                    qaPanel.remove();
+                                }
+
+                                state.currentPopup.remove();
+                                state.currentPopup = null;
+                                state.isPopupOpen = false;
+                                state.chatgptBreakdown = null;
+                                state.lastProcessedText = '';
+                                state.pinyinPermanentlyVisible = false;
+                                state.meaningPermanentlyVisible = false;
+                                state.qaExpanded = false;
+                            }
+
                             handleVideoPlay();
                         }
 
@@ -2406,6 +2589,27 @@ function setupVideoMonitoring() {
         // Also add traditional event listeners as fallback
         video.addEventListener('play', () => {
             console.log('🎬 VIDEO PLAY EVENT (traditional)');
+
+            // Close popup when video resumes
+            if (state.isPopupOpen && state.currentPopup) {
+                console.log('🎬 Video resumed - closing popup');
+
+                // Also close Q&A panel if it's open
+                const qaPanel = document.getElementById('qa-side-panel');
+                if (qaPanel) {
+                    qaPanel.remove();
+                }
+
+                state.currentPopup.remove();
+                state.currentPopup = null;
+                state.isPopupOpen = false;
+                state.chatgptBreakdown = null;
+                state.lastProcessedText = '';
+                state.pinyinPermanentlyVisible = false;
+                state.meaningPermanentlyVisible = false;
+                state.qaExpanded = false;
+            }
+
             if (!platform.isNetflix) { // Only use for non-Netflix to avoid duplicate handling
                 handleVideoPlay();
             }
@@ -2549,6 +2753,30 @@ console.log("Current URL:", window.location.href);
 console.log("Platform:", platform.name);
 console.log("Is Viki:", platform.isViki, "Is Netflix:", platform.isNetflix);
 
+// Load API key early
+async function initializeExtension() {
+    try {
+        await loadStoredKeys();
+        console.log("✅ API key loaded, available:", !!state.openaiKey);
+    } catch (error) {
+        console.error("❌ Error loading keys:", error);
+    }
+
+    try {
+        setupVideoMonitoring();
+        console.log("✅ setupVideoMonitoring completed");
+    } catch (error) {
+        console.error("❌ Error in setupVideoMonitoring:", error);
+    }
+
+    try {
+        setupSubtitleMonitoring();
+        console.log("✅ setupSubtitleMonitoring completed");
+    } catch (error) {
+        console.error("❌ Error in setupSubtitleMonitoring:", error);
+    }
+}
+
 // Netflix-specific initialization
 if (platform.isNetflix) {
     console.log("🎬 Netflix detected - setting up Netflix-specific handlers");
@@ -2565,23 +2793,9 @@ if (platform.isNetflix) {
     }, 3000);
 }
 
-try {
-    loadStoredKeys();
-    console.log("✅ loadStoredKeys completed");
-} catch (error) {
-    console.error("❌ Error in loadStoredKeys:", error);
-}
-
-try {
-    setupVideoMonitoring();
-    console.log("✅ setupVideoMonitoring completed");
-} catch (error) {
-    console.error("❌ Error in setupVideoMonitoring:", error);
-}
-
-try {
-    setupSubtitleMonitoring();
-    console.log("✅ setupSubtitleMonitoring completed");
-} catch (error) {
-    console.error("❌ Error in setupSubtitleMonitoring:", error);
-}
+// Call the initialization function
+initializeExtension().then(() => {
+    console.log("✅ Extension fully initialized");
+}).catch(error => {
+    console.error("❌ Error initializing extension:", error);
+});
