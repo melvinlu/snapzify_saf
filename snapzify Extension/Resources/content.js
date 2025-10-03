@@ -681,9 +681,24 @@ async function getQAResponse(question, chineseText) {
 async function getWordAnalysis(character, fullText, charIndex, abortSignal, retryCount = 0) {
     const MAX_RETRIES = 1; // Fewer retries for hover to keep it snappy
 
+    console.log('🔍 getWordAnalysis called:', { character, fullText, charIndex });
+
     try {
+        // Check if API key exists
+        if (!state.openaiKey) {
+            console.log('❌ No OpenAI key for word analysis');
+            return null;
+        }
+
         // Get the video title for context
         const videoTitle = state.currentVideoTitle || getVideoTitle();
+
+        // Extract surrounding context for better word detection
+        const chineseChars = fullText ? fullText.match(/[\u4e00-\u9fff]/g) || [] : [];
+        const contextStart = Math.max(0, charIndex - 3);
+        const contextEnd = Math.min(chineseChars.length, charIndex + 4);
+        const contextChars = chineseChars.slice(contextStart, contextEnd).join('');
+        const positionInContext = charIndex - contextStart;
 
         const requestBody = {
             model: 'gpt-3.5-turbo',
@@ -691,35 +706,30 @@ async function getWordAnalysis(character, fullText, charIndex, abortSignal, retr
                 role: 'user',
                 content: `Context: From video "${videoTitle}"
 Full text: "${fullText}"
-Character at position ${charIndex}: "${character}"
+Looking at these Chinese characters: "${contextChars}"
+The character "${character}" is at position ${positionInContext} in this substring (0-indexed).
 
-IMPORTANT TASK: Find the COMPLETE multi-character compound word that contains "${character}".
+CRITICAL: Find the word that contains "${character}" at this EXACT position in "${contextChars}".
 
-1. FIRST: Identify if "${character}" is part of a compound word by looking at surrounding characters
-2. Common compound words to check:
-   - 2-character: 大学, 工作, 朋友, 老师, 学生, 问题, 时间, 地方, 财富, 帮助
-   - 3-character: 大学生, 没问题, 不过来
-   - 4-character: 一路平安, 四平八稳
+Common words to check for:
+- 已经 (yǐjīng - already)
+- 半年 (bànnián - half year)
+- 年多 (niánduō - more than a year)
+- 结成 (jiéchéng - to form)
+- 侠侣 (xiálǚ - heroic couple)
 
-3. Look at 3 characters before AND 3 characters after "${character}" to find word boundaries
+ANALYZE "${contextChars}" character by character:
+${contextChars.split('').map((c, i) => `Position ${i}: ${c}`).join('\n')}
 
-4. Consider these patterns:
-   - Verb+Object compounds: 吃饭, 说话, 开车
-   - Modifier+Noun: 大学, 红色, 好人
-   - Common phrases: 不过, 可是, 因为, 所以
-
-EXAMPLES:
-- If "富" appears in "财富排名", return word="财富" (wealth)
-- If "助" appears in "帮助他", return word="帮助" (help)
-- If "名" appears in "排名前十", return word="排名" (ranking)
+The character "${character}" at position ${positionInContext} is part of which word?
 
 For multi-character compound words, return:
 {"isWord":true,"word":"[complete compound word]","wordDef":"[translation]","chars":[{"char":"[each char]","pinyin":"[pinyin]","def":"[individual meaning]"}...]}
 
-For single characters (including particles 的,了,呢,吗,吧,啊), return:
+For single characters, return:
 {"isWord":false,"chars":[{"char":"${character}","pinyin":"[pinyin]","def":"[meaning]"}]}
 
-Return ONLY valid JSON. DO NOT return just the single character if it's part of a compound word!`
+Return ONLY valid JSON.`
             }],
             max_tokens: 300,
             temperature: 0
@@ -738,11 +748,15 @@ Return ONLY valid JSON. DO NOT return just the single character if it's part of 
         if (!response.ok) return null;
 
         const data = await response.json();
+        console.log('🔍 Word analysis API response:', data);
         if (data.choices && data.choices[0]) {
             const content = data.choices[0].message.content;
+            console.log('🔍 Word analysis content:', content);
             const jsonMatch = content.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
-                return JSON.parse(jsonMatch[0]);
+                const parsed = JSON.parse(jsonMatch[0]);
+                console.log('🔍 Word analysis parsed result:', parsed);
+                return parsed;
             }
         }
     } catch (error) {
@@ -787,7 +801,8 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
     highlightedChars = [];
 
     // Get full text and character index
-    const fullText = state.currentSubtitleText;
+    const popup = document.getElementById('sublex-popup');
+    const fullText = popup?.getAttribute('data-subtitle-text') || state.currentSubtitleText;
     const allCharDivs = document.querySelectorAll('#sublex-popup [data-char]');
     const charIndex = Array.from(allCharDivs).indexOf(charDiv);
 
@@ -1032,6 +1047,12 @@ function createSubtitlePopup(text) {
         state.currentPopup = null;
     }
 
+    // Update data attribute if popup exists
+    const existingPopup = document.getElementById('sublex-popup');
+    if (existingPopup) {
+        existingPopup.setAttribute('data-subtitle-text', text);
+    }
+
     // Reset conversation history when creating a new popup with different text
     if (state.conversationHistory.length > 0) {
         const currentSystemMessage = state.conversationHistory[0];
@@ -1089,6 +1110,7 @@ function createSubtitlePopup(text) {
     // Create popup positioned above subtitle
     const popup = document.createElement('div');
     popup.id = 'sublex-popup';
+    popup.setAttribute('data-subtitle-text', text); // Store the subtitle text for word detection
 
     // Netflix may need higher z-index and different positioning
     const zIndex = platform.isNetflix ? '2147483647' : '2147483650';
