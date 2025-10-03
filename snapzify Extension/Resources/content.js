@@ -36,6 +36,7 @@ const state = {
     lastLoggedNetflixText: null, // Prevent spam logging
     isProcessingSubtitle: false, // Prevent multiple simultaneous processing
     lastKnownChineseSubtitle: null, // Store last Chinese subtitle before it disappears
+    justRewinded: false, // Track if we just rewinded to prevent auto-pause
     lastKnownSubtitleTime: null, // When we last saw a Chinese subtitle
     currentVideoTitle: null, // Store the current video/show title
     qaInputFocusInterval: null, // Track focus maintenance interval
@@ -1111,7 +1112,7 @@ function createSubtitlePopup(text) {
             min-width: 200px;
             max-width: 600px;
             resize: both;
-            overflow: visible;
+            overflow: auto;
             color: white;
             z-index: ${zIndex};
             pointer-events: auto;
@@ -1137,7 +1138,7 @@ function createSubtitlePopup(text) {
             min-width: 200px;
             max-width: 600px;
             resize: both;
-            overflow: visible;
+            overflow: auto;
             color: white;
             z-index: 2147483647;
             pointer-events: auto;
@@ -1164,7 +1165,7 @@ function createSubtitlePopup(text) {
             min-width: 200px;
             max-width: 600px;
             resize: both;
-            overflow: visible;
+            overflow: auto;
             color: white;
             z-index: ${zIndex};
             pointer-events: auto;
@@ -1374,7 +1375,7 @@ function createSubtitlePopup(text) {
     textAndButtonsWrapper.style.cssText = `
         display: flex;
         gap: 8px;
-        align-items: flex-start;
+        align-items: center;
         margin-bottom: 2px;
     `;
 
@@ -1568,7 +1569,7 @@ function createSubtitlePopup(text) {
         breakdownContainer.appendChild(loadingDiv);
     }
 
-    contentContainer.appendChild(breakdownContainer);
+    // Breakdown container will be added after textAndButtonsWrapper
 
     // Add toggle buttons section to the right of Chinese text
     const toggleButtonsSection = document.createElement('div');
@@ -1579,9 +1580,9 @@ function createSubtitlePopup(text) {
         flex-shrink: 0;
     `;
 
-    // Pinyin toggle button (compact)
+    // Pinyin toggle button (compact) with icon
     const pinyinToggle = document.createElement('button');
-    pinyinToggle.textContent = 'P';
+    pinyinToggle.innerHTML = '拼';  // Chinese character for "pinyin"
     pinyinToggle.title = 'Show/Hide Pinyin';
     pinyinToggle.style.cssText = `
         width: 28px;
@@ -1597,9 +1598,9 @@ function createSubtitlePopup(text) {
         transition: all 0.2s;
     `;
 
-    // Meaning toggle button (compact)
+    // Meaning toggle button (compact) with icon
     const meaningToggle = document.createElement('button');
-    meaningToggle.textContent = 'M';
+    meaningToggle.innerHTML = '译';  // Chinese character for "translate"
     meaningToggle.title = 'Show/Hide Meaning';
     meaningToggle.style.cssText = `
         width: 28px;
@@ -1747,10 +1748,10 @@ function createSubtitlePopup(text) {
             } else {
                 // Update position if popup moved
                 const popupRect = popup.getBoundingClientRect();
-                // Get the actual rendered height of the panel
-                const panelRect = qaPanel.getBoundingClientRect();
+                // Use fixed height for consistent positioning
+                const panelHeight = 250;
                 // Align bottoms exactly
-                const panelTop = popupRect.bottom - panelRect.height;
+                const panelTop = popupRect.bottom - panelHeight;
                 qaPanel.style.top = `${panelTop}px`;
                 qaPanel.style.left = `${popupRect.right + 10}px`;
                 qaPanel.style.display = 'flex';
@@ -1765,7 +1766,7 @@ function createSubtitlePopup(text) {
 
             qaDropdown.innerHTML = '◀';
             qaDropdown.title = 'Hide Q&A';
-            qaDropdown.style.background = 'rgba(100, 200, 100, 0.3)';
+            qaDropdown.style.background = 'rgba(255, 255, 255, 0.2)';
         } else {
             // Hide the side panel
             if (qaPanel) {
@@ -1792,11 +1793,65 @@ function createSubtitlePopup(text) {
     });
 
     qaDropdown.addEventListener('mouseleave', () => {
-        qaDropdown.style.background = state.qaExpanded ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+        qaDropdown.style.background = state.qaExpanded ? 'rgba(255, 255, 255, 0.2)' : 'rgba(255, 255, 255, 0.1)';
+    });
+
+    // Create rewind button (compact)
+    const rewindButton = document.createElement('button');
+    rewindButton.innerHTML = '↻';
+    rewindButton.title = 'Rewind 10 seconds';
+    rewindButton.style.cssText = `
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+
+    rewindButton.addEventListener('mouseenter', () => {
+        rewindButton.style.background = 'rgba(255, 255, 255, 0.2)';
+    });
+
+    rewindButton.addEventListener('mouseleave', () => {
+        rewindButton.style.background = 'rgba(255, 255, 255, 0.1)';
+    });
+
+    rewindButton.addEventListener('click', () => {
+        const video = document.querySelector('video');
+        if (!video) return;
+
+        // Set flag to prevent auto-pause after rewinding
+        state.justRewinded = true;
+        // Clear the lastProcessedText to ensure popup updates with new subtitle
+        state.lastProcessedText = '';
+        state.currentSubtitleText = null;
+
+        // Clear the flag after a short time
+        setTimeout(() => {
+            state.justRewinded = false;
+        }, 2000); // Reduced to 2 seconds
+
+        // Get the subtitle start time if available
+        if (state.currentSubtitleStartTime !== null && state.currentSubtitleStartTime !== undefined) {
+            video.currentTime = state.currentSubtitleStartTime;
+            video.play();
+            console.log('🔄 Rewinding to subtitle start:', state.currentSubtitleStartTime);
+        } else {
+            // Fallback: rewind 5 seconds and play
+            video.currentTime = Math.max(0, video.currentTime - 5);
+            video.play();
+            console.log('🔄 Rewinding 5 seconds (no subtitle time)');
+        }
     });
 
     toggleButtonsSection.appendChild(pinyinToggle);
     toggleButtonsSection.appendChild(meaningToggle);
+    toggleButtonsSection.appendChild(rewindButton);
     toggleButtonsSection.appendChild(qaDropdown);
 
     // Add buttons to wrapper
@@ -1804,6 +1859,9 @@ function createSubtitlePopup(text) {
 
     // Add wrapper to content container
     contentContainer.appendChild(textAndButtonsWrapper);
+
+    // Now add the meaning section BELOW the text/buttons
+    contentContainer.appendChild(breakdownContainer);
 
     // Helper function to create Q&A content
     const createQAContent = () => {
@@ -2352,16 +2410,36 @@ function checkForChineseSubtitles() {
             state.subtitleElement = null;
             console.log('📝 SUBTITLE: Non-Chinese subtitle, cleared current text');
 
-            // Auto-pause the video when Chinese subtitle disappears
+            // Handle when Chinese subtitle disappears
             if (state.isPopupOpen && state.currentPopup) {
-                const video = document.querySelector('video');
-                if (video && !video.paused) {
-                    video.pause();
-                    console.log('⏸️ Auto-paused video for subtitle review');
-                }
+                if (state.justRewinded) {
+                    // After rewind: close popup, don't pause
+                    console.log('🎯 Chinese text gone after rewind - closing popup');
 
-                // Keep popup open for review (don't close it)
-                console.log('🎯 Chinese text gone - keeping popup open for review');
+                    // Close Q&A panel if open
+                    const qaPanel = document.getElementById('qa-side-panel');
+                    if (qaPanel) {
+                        qaPanel.remove();
+                    }
+
+                    state.currentPopup.remove();
+                    state.currentPopup = null;
+                    state.isPopupOpen = false;
+                    state.chatgptBreakdown = null;
+                    state.lastProcessedText = '';
+                    state.pinyinPermanentlyVisible = false;
+                    state.meaningPermanentlyVisible = false;
+                    state.qaExpanded = false;
+                } else {
+                    // Normal: auto-pause and keep popup open for review
+                    const video = document.querySelector('video');
+                    if (video && !video.paused) {
+                        video.pause();
+                        console.log('⏸️ Auto-paused video for subtitle review');
+                    }
+                    // Keep popup open for review (don't close it)
+                    console.log('🎯 Chinese text gone - keeping popup open for review');
+                }
             }
         }
     }
@@ -2419,8 +2497,8 @@ function setupVideoMonitoring() {
                             // Video was just resumed
                             console.log('🎬 Netflix video RESUMED (detected via polling)');
 
-                            // Close popup when video resumes
-                            if (state.isPopupOpen && state.currentPopup) {
+                            // Close popup when video resumes (unless we just rewinded)
+                            if (state.isPopupOpen && state.currentPopup && !state.justRewinded) {
                                 console.log('🎬 Closing popup on Netflix resume');
 
                                 // Also close Q&A panel if it's open
@@ -2437,6 +2515,8 @@ function setupVideoMonitoring() {
                                 state.pinyinPermanentlyVisible = false;
                                 state.meaningPermanentlyVisible = false;
                                 state.qaExpanded = false;
+                            } else if (state.justRewinded) {
+                                console.log('🎬 Netflix resume - keeping popup open due to rewind');
                             }
 
                             handleVideoPlay();
@@ -2590,8 +2670,8 @@ function setupVideoMonitoring() {
         video.addEventListener('play', () => {
             console.log('🎬 VIDEO PLAY EVENT (traditional)');
 
-            // Close popup when video resumes
-            if (state.isPopupOpen && state.currentPopup) {
+            // Close popup when video resumes (unless we just rewinded)
+            if (state.isPopupOpen && state.currentPopup && !state.justRewinded) {
                 console.log('🎬 Video resumed - closing popup');
 
                 // Also close Q&A panel if it's open
@@ -2608,6 +2688,8 @@ function setupVideoMonitoring() {
                 state.pinyinPermanentlyVisible = false;
                 state.meaningPermanentlyVisible = false;
                 state.qaExpanded = false;
+            } else if (state.justRewinded) {
+                console.log('🎬 Video resumed - keeping popup open due to rewind');
             }
 
             if (!platform.isNetflix) { // Only use for non-Netflix to avoid duplicate handling
