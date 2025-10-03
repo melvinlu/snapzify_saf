@@ -38,7 +38,11 @@ const state = {
     lastKnownChineseSubtitle: null, // Store last Chinese subtitle before it disappears
     lastKnownSubtitleTime: null, // When we last saw a Chinese subtitle
     currentVideoTitle: null, // Store the current video/show title
-    qaInputFocusInterval: null // Track focus maintenance interval
+    qaInputFocusInterval: null, // Track focus maintenance interval
+    savedPopupPosition: null, // Store user's preferred popup position
+    pinyinPermanentlyVisible: false, // Track if pinyin should stay visible for this popup
+    meaningPermanentlyVisible: false, // Track if meaning should stay visible for this popup
+    qaExpanded: false // Track if Q&A section is expanded
 };
 
 // Helper function to get the video title from the page
@@ -163,6 +167,11 @@ function updatePopupWithPartialData(partialData) {
         const meaningDiv = state.currentPopup.querySelector('#chinese-meaning');
         if (meaningDiv) {
             meaningDiv.textContent = partialData.meaning;
+            // Keep hidden unless permanently visible
+            if (!state.meaningPermanentlyVisible) {
+                meaningDiv.style.opacity = '0';
+                meaningDiv.style.visibility = 'hidden';
+            }
             console.log('🌊 Updated meaning');
         }
     }
@@ -566,13 +575,15 @@ function updatePopupWithChatGPTData(breakdown) {
     });
 
     // Update meaning section
-    const meaningSection = state.currentPopup.querySelector('#meaning-section');
-    if (meaningSection) {
-        if (breakdown.meaning) {
-            // Replace loading with meaning
-            meaningSection.textContent = breakdown.meaning;
-            meaningSection.style.fontStyle = 'normal';
-            meaningSection.style.color = 'rgba(255, 255, 255, 0.9)';
+    const meaningDiv = state.currentPopup.querySelector('#chinese-meaning');
+    if (meaningDiv && breakdown.meaning) {
+        meaningDiv.textContent = breakdown.meaning;
+        meaningDiv.style.fontStyle = 'normal';
+        meaningDiv.style.color = 'rgba(255, 255, 255, 0.9)';
+        // Keep hidden unless permanently visible
+        if (!state.meaningPermanentlyVisible) {
+            meaningDiv.style.opacity = '0';
+            meaningDiv.style.visibility = 'hidden';
         }
     }
 
@@ -1049,6 +1060,19 @@ function createSubtitlePopup(text) {
         console.log('📍 No subtitle element, using default position');
     }
 
+    // Load saved position from localStorage
+    if (!state.savedPopupPosition) {
+        try {
+            const saved = localStorage.getItem('sublex-popup-position');
+            if (saved) {
+                state.savedPopupPosition = JSON.parse(saved);
+                console.log('📍 Loaded saved popup position:', state.savedPopupPosition);
+            }
+        } catch (e) {
+            console.error('Failed to load saved position:', e);
+        }
+    }
+
     // Create popup positioned above subtitle
     const popup = document.createElement('div');
     popup.id = 'sublex-popup';
@@ -1056,9 +1080,32 @@ function createSubtitlePopup(text) {
     // Netflix may need higher z-index and different positioning
     const zIndex = platform.isNetflix ? '2147483647' : '2147483650';
 
-    // For Netflix, use a simpler centered position
+    // Use saved position if available, otherwise use defaults
     let popupStyles = '';
-    if (platform.isNetflix) {
+    if (state.savedPopupPosition) {
+        // Use saved position
+        popupStyles = `
+            position: fixed;
+            top: ${state.savedPopupPosition.top}px;
+            left: ${state.savedPopupPosition.left}px;
+            background: rgba(20, 20, 30, 0.98);
+            border: 2px solid rgba(255, 255, 255, 0.4);
+            border-radius: 12px;
+            padding: 15px;
+            padding-top: 25px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.9);
+            min-width: 400px;
+            max-width: 90vw;
+            color: white;
+            z-index: ${zIndex};
+            pointer-events: auto;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            cursor: move;
+        `;
+    } else if (platform.isNetflix) {
         popupStyles = `
             position: fixed;
             top: 82%;
@@ -1067,8 +1114,8 @@ function createSubtitlePopup(text) {
             background: rgba(20, 20, 30, 0.98);
             border: 2px solid rgba(255, 255, 255, 0.4);
             border-radius: 12px;
-            padding: 20px;
-            padding-top: 15px;
+            padding: 15px;
+            padding-top: 25px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.9);
             min-width: 400px;
             max-width: 90vw;
@@ -1079,6 +1126,7 @@ function createSubtitlePopup(text) {
             display: block !important;
             visibility: visible !important;
             opacity: 1 !important;
+            cursor: move;
         `;
     } else {
         // Original positioning for Viki
@@ -1090,8 +1138,8 @@ function createSubtitlePopup(text) {
             background: rgba(20, 20, 30, 0.95);
             border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 12px;
-            padding: 20px;
-            padding-top: 15px;
+            padding: 15px;
+            padding-top: 25px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.8);
             min-width: 400px;
             max-width: 90vw;
@@ -1101,11 +1149,93 @@ function createSubtitlePopup(text) {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             display: block !important;
             visibility: visible !important;
+            cursor: move;
         `;
     }
 
     popup.style.cssText = popupStyles;
     console.log('🎨 Popup styles set, z-index:', zIndex, 'Platform:', platform.name);
+
+    // Add drag handle indicator at the top
+    const dragHandle = document.createElement('div');
+    dragHandle.style.cssText = `
+        position: absolute;
+        top: 5px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 40px;
+        height: 4px;
+        background: rgba(255, 255, 255, 0.3);
+        border-radius: 2px;
+        cursor: move;
+    `;
+    popup.appendChild(dragHandle);
+
+    // Implement drag functionality
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let popupStartX = 0;
+    let popupStartY = 0;
+
+    const startDrag = (e) => {
+        // Only start drag if clicking on the popup itself or drag handle, not input fields
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') {
+            return;
+        }
+
+        isDragging = true;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+
+        const rect = popup.getBoundingClientRect();
+        popupStartX = rect.left;
+        popupStartY = rect.top;
+
+        popup.style.cursor = 'grabbing';
+        e.preventDefault();
+    };
+
+    const doDrag = (e) => {
+        if (!isDragging) return;
+
+        const deltaX = e.clientX - dragStartX;
+        const deltaY = e.clientY - dragStartY;
+
+        const newLeft = popupStartX + deltaX;
+        const newTop = popupStartY + deltaY;
+
+        // Remove any transform that was centering the popup
+        popup.style.transform = 'none';
+        popup.style.left = newLeft + 'px';
+        popup.style.top = newTop + 'px';
+    };
+
+    const endDrag = () => {
+        if (!isDragging) return;
+
+        isDragging = false;
+        popup.style.cursor = 'move';
+
+        // Save the new position
+        const rect = popup.getBoundingClientRect();
+        state.savedPopupPosition = {
+            top: rect.top,
+            left: rect.left
+        };
+
+        // Save to localStorage
+        try {
+            localStorage.setItem('sublex-popup-position', JSON.stringify(state.savedPopupPosition));
+            console.log('💾 Saved popup position:', state.savedPopupPosition);
+        } catch (e) {
+            console.error('Failed to save position:', e);
+        }
+    };
+
+    popup.addEventListener('mousedown', startDrag);
+    document.addEventListener('mousemove', doDrag);
+    document.addEventListener('mouseup', endDrag);
 
 
     // API Key input section (hidden by default)
@@ -1185,7 +1315,7 @@ function createSubtitlePopup(text) {
     contentContainer.style.cssText = `
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 0px;
     `;
 
     // Create character grid with pinyin - stable layout
@@ -1197,7 +1327,7 @@ function createSubtitlePopup(text) {
         align-items: start;
         gap: 1px;
         flex-wrap: wrap;
-        margin-bottom: 0px;
+        margin-bottom: 2px;
     `;
 
     // Split text into characters and add pinyin if available
@@ -1226,7 +1356,7 @@ function createSubtitlePopup(text) {
                 display: flex;
                 flex-direction: column;
                 align-items: center;
-                min-width: 28px;
+                min-width: 24px;
                 margin: 0;
                 padding: 0;
             `;
@@ -1234,12 +1364,12 @@ function createSubtitlePopup(text) {
             // Character
             const charDiv = document.createElement('div');
             charDiv.style.cssText = `
-                font-size: 26pt;
+                font-size: 24pt;
                 color: white;
                 font-weight: normal;
                 line-height: 1;
                 text-align: center;
-                margin-bottom: 3px;
+                margin-bottom: 1px;
                 cursor: pointer;
                 transition: color 0.2s;
             `;
@@ -1262,11 +1392,13 @@ function createSubtitlePopup(text) {
             const pinyinDiv = document.createElement('div');
             pinyinDiv.className = 'pinyin-label';  // Add class for streaming updates
             pinyinDiv.style.cssText = `
-                font-size: 11px;
+                font-size: 10px;
                 color: rgba(255, 255, 255, 0.7);
                 text-align: center;
-                min-height: 14px;
+                height: 10px;
                 line-height: 1;
+                transition: opacity 0.2s;
+                opacity: 0;
             `;
 
             // Only add pinyin text if we have ChatGPT data
@@ -1274,6 +1406,8 @@ function createSubtitlePopup(text) {
             pinyinDiv.textContent = pinyin;
             // Create ID based on the Chinese character index (0-based)
             pinyinDiv.id = `pinyin-${chineseCharCount}`;
+            // Initially hidden
+            pinyinDiv.style.opacity = '0';
 
             charColumn.appendChild(pinyinDiv);
 
@@ -1303,12 +1437,12 @@ function createSubtitlePopup(text) {
 
             const punctDiv = document.createElement('div');
             punctDiv.style.cssText = `
-                font-size: 26pt;
+                font-size: 24pt;
                 color: white;
                 font-weight: normal;
                 line-height: 1;
                 text-align: center;
-                margin-bottom: 3px;
+                margin-bottom: 1px;
             `;
             punctDiv.textContent = char;
 
@@ -1317,7 +1451,7 @@ function createSubtitlePopup(text) {
             // Add empty space below for alignment
             const emptyDiv = document.createElement('div');
             emptyDiv.style.cssText = `
-                min-height: 14px;
+                height: 10px;
             `;
             punctColumn.appendChild(emptyDiv);
 
@@ -1333,6 +1467,7 @@ function createSubtitlePopup(text) {
         color: rgba(255, 255, 255, 0.9);
         font-size: 14px;
         line-height: 1.4;
+        margin-bottom: 4px;
     `;
 
     if (state.chatgptBreakdown) {
@@ -1342,11 +1477,14 @@ function createSubtitlePopup(text) {
         if (state.chatgptBreakdown.meaning) {
             const meaningDiv = document.createElement('div');
             meaningDiv.style.cssText = `
-                padding: 12px;
+                padding: 4px 8px;
                 background: rgba(255, 255, 255, 0.05);
                 border-radius: 6px;
-                line-height: 1.4;
+                line-height: 1.3;
                 text-align: center;
+                opacity: 0;
+                visibility: hidden;
+                transition: opacity 0.2s, visibility 0.2s;
             `;
             meaningDiv.textContent = state.chatgptBreakdown.meaning;
             meaningDiv.id = 'chinese-meaning';  // Changed to match streaming update function
@@ -1357,9 +1495,12 @@ function createSubtitlePopup(text) {
         const loadingDiv = document.createElement('div');
         loadingDiv.style.cssText = `
             text-align: center;
-            padding: 20px;
+            padding: 4px 8px;
             color: rgba(255, 255, 255, 0.6);
             font-style: italic;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.2s, visibility 0.2s;
         `;
         loadingDiv.textContent = 'Processing...';
         loadingDiv.id = 'chinese-meaning';  // Changed to match streaming update function
@@ -1368,13 +1509,187 @@ function createSubtitlePopup(text) {
 
     contentContainer.appendChild(breakdownContainer);
 
+    // Add toggle buttons section before Q&A
+    const toggleButtonsSection = document.createElement('div');
+    toggleButtonsSection.style.cssText = `
+        display: flex;
+        gap: 8px;
+        margin-bottom: 0px;
+    `;
+
+    // Pinyin toggle button
+    const pinyinToggle = document.createElement('button');
+    pinyinToggle.textContent = 'Pinyin';
+    pinyinToggle.style.cssText = `
+        flex: 3;
+        padding: 6px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+
+    // Meaning toggle button
+    const meaningToggle = document.createElement('button');
+    meaningToggle.textContent = 'Meaning';
+    meaningToggle.style.cssText = `
+        flex: 3;
+        padding: 6px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+
+    // Q&A dropdown toggle button
+    const qaDropdown = document.createElement('button');
+    qaDropdown.innerHTML = '▼';
+    qaDropdown.title = 'Show Q&A';
+    qaDropdown.style.cssText = `
+        flex: 1;
+        padding: 6px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 10px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+
+    // Helper function to show/hide pinyin
+    const setPinyinVisibility = (visible) => {
+        const pinyinElements = popup.querySelectorAll('.pinyin-label');
+        pinyinElements.forEach(el => {
+            el.style.opacity = visible ? '1' : '0';
+        });
+    };
+
+    // Helper function to show/hide meaning
+    const setMeaningVisibility = (visible) => {
+        const meaningElement = popup.querySelector('#chinese-meaning');
+        if (meaningElement) {
+            meaningElement.style.opacity = visible ? '1' : '0';
+            meaningElement.style.visibility = visible ? 'visible' : 'hidden';
+        }
+    };
+
+    // Initially hide pinyin and meaning
+    setTimeout(() => {
+        setPinyinVisibility(false);
+        setMeaningVisibility(false);
+    }, 10);
+
+    // Pinyin button hover/click handlers
+    pinyinToggle.addEventListener('mouseenter', () => {
+        if (!state.pinyinPermanentlyVisible) {
+            setPinyinVisibility(true);
+        }
+        pinyinToggle.style.background = 'rgba(255, 255, 255, 0.2)';
+    });
+
+    pinyinToggle.addEventListener('mouseleave', () => {
+        if (!state.pinyinPermanentlyVisible) {
+            setPinyinVisibility(false);
+        }
+        pinyinToggle.style.background = state.pinyinPermanentlyVisible ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+    });
+
+    pinyinToggle.addEventListener('click', () => {
+        state.pinyinPermanentlyVisible = !state.pinyinPermanentlyVisible;
+        setPinyinVisibility(state.pinyinPermanentlyVisible);
+        pinyinToggle.textContent = state.pinyinPermanentlyVisible ? 'Hide' : 'Pinyin';
+        pinyinToggle.style.background = state.pinyinPermanentlyVisible ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+    });
+
+    // Meaning button hover/click handlers
+    meaningToggle.addEventListener('mouseenter', () => {
+        if (!state.meaningPermanentlyVisible) {
+            setMeaningVisibility(true);
+        }
+        meaningToggle.style.background = 'rgba(255, 255, 255, 0.2)';
+    });
+
+    meaningToggle.addEventListener('mouseleave', () => {
+        if (!state.meaningPermanentlyVisible) {
+            setMeaningVisibility(false);
+        }
+        meaningToggle.style.background = state.meaningPermanentlyVisible ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+    });
+
+    meaningToggle.addEventListener('click', () => {
+        state.meaningPermanentlyVisible = !state.meaningPermanentlyVisible;
+        setMeaningVisibility(state.meaningPermanentlyVisible);
+        meaningToggle.textContent = state.meaningPermanentlyVisible ? 'Hide' : 'Meaning';
+        meaningToggle.style.background = state.meaningPermanentlyVisible ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+    });
+
+    // Q&A dropdown handlers
+    const toggleQASection = (expand) => {
+        state.qaExpanded = expand;
+        const qa = popup.querySelector('#qa-section');
+        if (qa) {
+            if (expand) {
+                qa.style.display = 'block';
+                setTimeout(() => {
+                    qa.style.opacity = '1';
+                    // Auto-focus the input
+                    const input = qa.querySelector('#qa-input');
+                    if (input) {
+                        input.focus();
+                    }
+                }, 10);
+                qaDropdown.innerHTML = '▲';
+                qaDropdown.title = 'Hide Q&A';
+                qaDropdown.style.background = 'rgba(100, 200, 100, 0.3)';
+            } else {
+                qa.style.opacity = '0';
+                setTimeout(() => {
+                    qa.style.display = 'none';
+                }, 300);
+                qaDropdown.innerHTML = '▼';
+                qaDropdown.title = 'Show Q&A';
+                qaDropdown.style.background = 'rgba(255, 255, 255, 0.1)';
+            }
+        }
+    };
+
+    qaDropdown.addEventListener('click', () => {
+        toggleQASection(!state.qaExpanded);
+    });
+
+    qaDropdown.addEventListener('mouseenter', () => {
+        if (!state.qaExpanded) {
+            qaDropdown.style.background = 'rgba(255, 255, 255, 0.2)';
+        }
+    });
+
+    qaDropdown.addEventListener('mouseleave', () => {
+        qaDropdown.style.background = state.qaExpanded ? 'rgba(100, 200, 100, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+    });
+
+    toggleButtonsSection.appendChild(pinyinToggle);
+    toggleButtonsSection.appendChild(meaningToggle);
+    toggleButtonsSection.appendChild(qaDropdown);
+    contentContainer.appendChild(toggleButtonsSection);
+
     // Add Q&A section
     const qaSection = document.createElement('div');
+    qaSection.id = 'qa-section';
     qaSection.style.cssText = `
-        margin-top: 12px;
-        padding: 12px;
+        margin-top: 0px;
+        padding: 8px;
         background: rgba(255, 255, 255, 0.05);
         border-radius: 8px;
+        display: none;
+        opacity: 0;
+        transition: opacity 0.3s;
     `;
 
     // Q&A response area
@@ -1627,6 +1942,10 @@ function createSubtitlePopup(text) {
     const closePopup = () => {
         console.log('🧹 Closing popup and resetting state');
 
+        // Clean up drag listeners
+        document.removeEventListener('mousemove', doDrag);
+        document.removeEventListener('mouseup', endDrag);
+
         // Clear focus maintenance interval
         if (state.qaInputFocusInterval) {
             clearInterval(state.qaInputFocusInterval);
@@ -1657,6 +1976,14 @@ function createSubtitlePopup(text) {
         state.chatgptBreakdown = null;
         state.lastProcessedText = '';
         state.isProcessingSubtitle = false;
+        state.pinyinPermanentlyVisible = false;
+        state.meaningPermanentlyVisible = false;
+        state.qaExpanded = false;
+
+        // Resume polling (Netflix) when popup closes
+        if (platform.isNetflix && state.netflixPolling) {
+            state.netflixPolling.start();
+        }
 
         resumeVideo();
         console.log('✅ All popups closed, state reset');
@@ -1736,6 +2063,11 @@ function createSubtitlePopup(text) {
     }
 
     state.currentPopup = popup;
+
+    // Stop polling while popup is open (Netflix)
+    if (platform.isNetflix && state.netflixPolling) {
+        state.netflixPolling.stop();
+    }
 
     // Debug: Check actual computed styles and position
     setTimeout(() => {
@@ -1892,47 +2224,76 @@ function setupVideoMonitoring() {
         if (platform.isNetflix) {
             let lastPausedState = video.paused;
             let pollCount = 0;
+            let pollInterval = null;
             console.log('🎬 Starting Netflix pause polling, initial state:', lastPausedState);
 
-            const pollInterval = setInterval(() => {
-                pollCount++;
-                const currentPausedState = video.paused;
+            const startPolling = () => {
+                if (pollInterval) return; // Already polling
 
-                // Log every 50 polls (5 seconds) to confirm polling is running
-                if (pollCount % 50 === 0) {
-                    console.log('🔍 Netflix polling active, check #' + pollCount + ', paused:', currentPausedState);
-                }
-
-                if (currentPausedState !== lastPausedState) {
-                    console.log('🎬 Netflix video state changed:', lastPausedState, '->', currentPausedState);
-
-                    if (currentPausedState) {
-                        // Video was just paused
-                        console.log('🎬 Netflix video PAUSED (detected via polling)');
-                        console.log('🎬 Video element still exists:', !!video);
-                        console.log('🎬 Video paused property:', video.paused);
-                        handleVideoPause();
-                    } else {
-                        // Video was just resumed
-                        console.log('🎬 Netflix video RESUMED (detected via polling)');
-                        handleVideoPlay();
+                pollInterval = setInterval(() => {
+                    // Skip polling if popup is open
+                    if (state.isPopupOpen || document.getElementById('sublex-popup')) {
+                        return;
                     }
 
-                    lastPausedState = currentPausedState;
-                }
+                    pollCount++;
+                    const currentPausedState = video.paused;
 
-                // Check if video element is still valid
-                if (!document.contains(video)) {
-                    console.log('⚠️ Video element removed from DOM, stopping polling');
+                    // Log every 5000 polls (50 seconds) to confirm polling is running
+                    if (pollCount % 5000 === 0) {
+                        console.log('🔍 Netflix polling active, check #' + pollCount + ', paused:', currentPausedState);
+                    }
+
+                    if (currentPausedState !== lastPausedState) {
+                        console.log('🎬 Netflix video state changed:', lastPausedState, '->', currentPausedState);
+
+                        if (currentPausedState) {
+                            // Video was just paused
+                            console.log('🎬 Netflix video PAUSED (detected via polling)');
+                            console.log('🎬 Video element still exists:', !!video);
+                            console.log('🎬 Video paused property:', video.paused);
+                            handleVideoPause();
+                        } else {
+                            // Video was just resumed
+                            console.log('🎬 Netflix video RESUMED (detected via polling)');
+                            handleVideoPlay();
+                        }
+
+                        lastPausedState = currentPausedState;
+                    }
+
+                    // Check if video element is still valid
+                    if (!document.contains(video)) {
+                        console.log('⚠️ Video element removed from DOM, stopping polling');
+                        clearInterval(pollInterval);
+                        pollInterval = null;
+
+                        // Try to find a new video element
+                        setTimeout(() => {
+                            console.log('🔄 Looking for new video element...');
+                            findAndMonitorVideo();
+                        }, 1000);
+                    }
+                }, 10); // Check every 10ms for more responsive detection
+                console.log('🎬 Polling started');
+            };
+
+            const stopPolling = () => {
+                if (pollInterval) {
                     clearInterval(pollInterval);
-
-                    // Try to find a new video element
-                    setTimeout(() => {
-                        console.log('🔄 Looking for new video element...');
-                        findAndMonitorVideo();
-                    }, 1000);
+                    pollInterval = null;
+                    console.log('🎬 Polling stopped');
                 }
-            }, 100); // Check every 100ms
+            };
+
+            // Store functions in state for access from other parts
+            state.netflixPolling = {
+                start: startPolling,
+                stop: stopPolling
+            };
+
+            // Start initial polling
+            startPolling();
         }
 
         // Define handler functions that can be called from both events and polling
@@ -1958,6 +2319,11 @@ function setupVideoMonitoring() {
             state.wasPlayingBeforePopup = true;
             state.isProcessingSubtitle = false;  // Critical: reset this flag
 
+            // Resume polling (Netflix)
+            if (platform.isNetflix && state.netflixPolling) {
+                state.netflixPolling.start();
+            }
+
             console.log('🎬 Video resumed - all state reset for next pause');
             console.log('🎬 State after reset:', {
                 isPopupOpen: state.isPopupOpen,
@@ -1976,6 +2342,11 @@ function setupVideoMonitoring() {
             if (state.isPopupOpen) {
                 console.log('⚠️ Skipping - popup already open');
                 return;
+            }
+
+            // Stop polling while popup is open (Netflix)
+            if (platform.isNetflix && state.netflixPolling) {
+                state.netflixPolling.stop();
             }
 
             // For Netflix, always reset processing flag on new pause to avoid getting stuck
