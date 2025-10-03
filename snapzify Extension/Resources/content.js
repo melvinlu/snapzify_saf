@@ -1,5 +1,15 @@
 console.log("SubLex extension v7 loaded on:", window.location.href);
 
+// Platform detection
+const platform = {
+    isViki: window.location.hostname.includes('viki.com'),
+    isNetflix: window.location.hostname.includes('netflix.com'),
+    name: window.location.hostname.includes('viki.com') ? 'viki' :
+          window.location.hostname.includes('netflix.com') ? 'netflix' : 'unknown'
+};
+
+console.log('Platform detected:', platform.name);
+
 // Test message to background
 browser.runtime.sendMessage({ greeting: "hello" }).then((response) => {
     console.log("Received response: ", response);
@@ -22,19 +32,86 @@ const state = {
     responseCache: {}, // Cache API responses for speed
     conversationHistory: [], // Store conversation context for Q&A
     subtitleHistory: [], // Track subtitle history for navigation
-    currentSubtitleStartTime: null // Track when current subtitle started
+    currentSubtitleStartTime: null, // Track when current subtitle started
+    lastLoggedNetflixText: null, // Prevent spam logging
+    isProcessingSubtitle: false, // Prevent multiple simultaneous processing
+    lastKnownChineseSubtitle: null, // Store last Chinese subtitle before it disappears
+    lastKnownSubtitleTime: null, // When we last saw a Chinese subtitle
+    currentVideoTitle: null, // Store the current video/show title
+    qaInputFocusInterval: null // Track focus maintenance interval
 };
+
+// Helper function to get the video title from the page
+function getVideoTitle() {
+    let title = null;
+
+    if (platform.isNetflix) {
+        // Netflix - try multiple selectors
+        const titleElement = document.querySelector('.video-title h4') ||
+                            document.querySelector('.ellipsize-text h4') ||
+                            document.querySelector('[data-uia="video-title"]') ||
+                            document.querySelector('.video-title span') ||
+                            document.querySelector('.previewModal--player-titleTreatment-title');
+        if (titleElement) {
+            title = titleElement.textContent?.trim();
+        }
+
+        // If no title found, try getting episode info
+        if (!title) {
+            const episodeTitle = document.querySelector('.ellipsize-text span');
+            const showTitle = document.querySelector('.ellipsize-text h4');
+            if (showTitle && episodeTitle) {
+                title = `${showTitle.textContent?.trim()} - ${episodeTitle.textContent?.trim()}`;
+            }
+        }
+    } else if (platform.isViki) {
+        // Viki - try multiple selectors
+        const titleElement = document.querySelector('.video-title') ||
+                            document.querySelector('.vkp-title') ||
+                            document.querySelector('[class*="title"]');
+        if (titleElement) {
+            title = titleElement.textContent?.trim();
+        }
+    }
+
+    // Fallback to page title if no specific element found
+    if (!title && document.title) {
+        // Clean up the page title (remove site name, etc.)
+        title = document.title.split('|')[0]?.split('-')[0]?.trim();
+    }
+
+    return title || 'Unknown Video';
+}
 
 // Helper function to get the correct container for popups (handles fullscreen)
 function getPopupContainer() {
-    // Check for fullscreen elements including Viki's custom fullscreen
-    const fullscreenElement = document.fullscreenElement ||
-                            document.webkitFullscreenElement ||
-                            document.querySelector('.video-js.vjs-fullscreen') ||
-                            document.querySelector('[data-fullscreen="true"]') ||
-                            document.querySelector('.vjs-fullscreen');
+    // Check for fullscreen elements including platform-specific fullscreen
+    let fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
 
-    return fullscreenElement || document.body;
+    if (platform.isViki) {
+        fullscreenElement = fullscreenElement ||
+                          document.querySelector('.video-js.vjs-fullscreen') ||
+                          document.querySelector('[data-fullscreen="true"]') ||
+                          document.querySelector('.vjs-fullscreen');
+    } else if (platform.isNetflix) {
+        // Netflix specific containers - try to find the video overlay area
+        fullscreenElement = fullscreenElement ||
+                          document.querySelector('.watch-video--player-view') ||
+                          document.querySelector('.watch-video') ||
+                          document.querySelector('.PlayerContainer') ||
+                          document.querySelector('[data-uia="video-canvas"]');
+
+        // Log what we found for debugging
+        console.log('🎬 Netflix container search:', {
+            fullscreenElement: !!fullscreenElement,
+            elementType: fullscreenElement?.tagName,
+            elementClass: fullscreenElement?.className
+        });
+    }
+
+    const container = fullscreenElement || document.body;
+    console.log('📦 Using popup container:', container === document.body ? 'document.body' : container.className || container.tagName);
+    return container;
 }
 
 // Helper function to update popup with partial streaming data
@@ -42,6 +119,19 @@ function updatePopupWithPartialData(partialData) {
     if (!state.currentPopup) {
         console.log('🌊 No popup to update');
         return;
+    }
+
+    // Preserve Q&A input state before any updates
+    const qaInput = state.currentPopup.querySelector('#qa-input');
+    let inputState = null;
+    if (qaInput) {
+        inputState = {
+            value: qaInput.value,
+            selectionStart: qaInput.selectionStart,
+            selectionEnd: qaInput.selectionEnd,
+            selectionDirection: qaInput.selectionDirection,
+            hasFocus: document.activeElement === qaInput
+        };
     }
 
     const chineseTextDiv = state.currentPopup.querySelector('#chinese-text');
@@ -74,6 +164,15 @@ function updatePopupWithPartialData(partialData) {
         if (meaningDiv) {
             meaningDiv.textContent = partialData.meaning;
             console.log('🌊 Updated meaning');
+        }
+    }
+
+    // Restore Q&A input state after updates
+    if (inputState && qaInput) {
+        qaInput.value = inputState.value;
+        if (inputState.hasFocus) {
+            qaInput.focus();
+            qaInput.setSelectionRange(inputState.selectionStart, inputState.selectionEnd, inputState.selectionDirection);
         }
     }
 }
@@ -109,12 +208,17 @@ async function getChatGPTBreakdown(chineseText, retryCount = 0) {
     try {
         console.log(`🤖 Getting analysis (attempt ${retryCount + 1}):`, chineseText);
 
+        // Get the video title for context
+        const videoTitle = state.currentVideoTitle || getVideoTitle();
+        state.currentVideoTitle = videoTitle; // Cache it
+
         const requestBodyStartTime = performance.now();
         const requestBody = {
             model: 'gpt-3.5-turbo',
             messages: [{
                 role: 'user',
-                content: `Analyze this Chinese text: "${chineseText}"
+                content: `Context: This Chinese text is from the video "${videoTitle}".
+Analyze this Chinese text: "${chineseText}"
 
 CRITICAL RULES:
 1. For "meaning": Translate the ENTIRE TEXT "${chineseText}" as a complete sentence/phrase
@@ -329,12 +433,16 @@ MAINTAIN EXACT CHARACTER ORDER!`
 async function processSubtitleWithChatGPT(subtitleText) {
     const startTime = performance.now();
     console.log('=== Starting ChatGPT Processing ===');
+    console.log('📊 Platform:', platform.name);
     console.log('📊 Processing subtitle text:', `"${subtitleText}"`);
     console.log('📊 OpenAI Key available:', !!state.openaiKey);
+    console.log('📊 Popup already open:', state.isPopupOpen);
+    console.log('📊 Currently processing:', state.isProcessingSubtitle);
     console.log('⏱️ Start time:', new Date().toISOString());
 
     if (!state.openaiKey) {
-        console.log('❌ No OpenAI key available');
+        console.log('❌ No OpenAI key available - will show popup for key input');
+        createSubtitlePopup(subtitleText);
         return;
     }
 
@@ -364,8 +472,10 @@ async function processSubtitleWithChatGPT(subtitleText) {
     // Create popup immediately with loading state (before API call)
     if (!state.isPopupOpen) {
         console.log('📊 Creating popup immediately with loading state');
+        console.log('📊 About to call createSubtitlePopup with text:', subtitleText);
         state.chatgptBreakdown = null; // Clear old data
         createSubtitlePopup(subtitleText);
+        console.log('📊 createSubtitlePopup returned, popup open:', state.isPopupOpen);
     }
 
     // Get ChatGPT breakdown
@@ -417,6 +527,19 @@ async function processSubtitleWithChatGPT(subtitleText) {
 function updatePopupWithChatGPTData(breakdown) {
     if (!state.currentPopup) return;
 
+    // Preserve Q&A input state before any updates
+    const qaInput = state.currentPopup.querySelector('#qa-input');
+    let inputState = null;
+    if (qaInput) {
+        inputState = {
+            value: qaInput.value,
+            selectionStart: qaInput.selectionStart,
+            selectionEnd: qaInput.selectionEnd,
+            selectionDirection: qaInput.selectionDirection,
+            hasFocus: document.activeElement === qaInput
+        };
+    }
+
     // Get all character divs and filter for Chinese characters only
     const allCharDivs = state.currentPopup.querySelectorAll('[data-char]');
     const chineseCharDivs = [];
@@ -454,6 +577,18 @@ function updatePopupWithChatGPTData(breakdown) {
     }
 
     console.log('✅ Popup updated with ChatGPT data');
+
+    // Restore Q&A input state after updates
+    if (inputState) {
+        const qaInputAfter = state.currentPopup.querySelector('#qa-input');
+        if (qaInputAfter) {
+            qaInputAfter.value = inputState.value;
+            if (inputState.hasFocus) {
+                qaInputAfter.focus();
+                qaInputAfter.setSelectionRange(inputState.selectionStart, inputState.selectionEnd, inputState.selectionDirection);
+            }
+        }
+    }
 }
 
 // Global hover popup state
@@ -464,6 +599,10 @@ let currentHoverAbortController = null; // Track current hover request to cancel
 // Q&A Function with conversation context
 async function getQAResponse(question, chineseText) {
     try {
+        // Get the video title for context
+        const videoTitle = state.currentVideoTitle || getVideoTitle();
+        state.currentVideoTitle = videoTitle; // Cache it
+
         // Check if we need to reset context for a new text
         const currentSystemMessage = state.conversationHistory[0];
         const needsNewContext = !currentSystemMessage || !currentSystemMessage.content.includes(chineseText);
@@ -473,7 +612,7 @@ async function getQAResponse(question, chineseText) {
             console.log('🔄 Resetting Q&A context for new text:', chineseText);
             state.conversationHistory = [{
                 role: 'system',
-                content: `You are helping a user learn Chinese. The current subtitle/text being studied is: "${chineseText}". Answer questions about this text, its grammar, vocabulary, or cultural context. Be concise but helpful.`
+                content: `You are helping a user learn Chinese. The user is watching "${videoTitle}". The current subtitle/text being studied is: "${chineseText}". Answer questions about this text, its grammar, vocabulary, or cultural context. Be concise but helpful.`
             }];
         }
 
@@ -536,11 +675,15 @@ async function getWordAnalysis(character, fullText, charIndex, abortSignal, retr
     const MAX_RETRIES = 1; // Fewer retries for hover to keep it snappy
 
     try {
+        // Get the video title for context
+        const videoTitle = state.currentVideoTitle || getVideoTitle();
+
         const requestBody = {
             model: 'gpt-3.5-turbo',
             messages: [{
                 role: 'user',
-                content: `Text: ${fullText}
+                content: `Context: From video "${videoTitle}"
+Text: ${fullText}
 Character at position ${charIndex}: "${character}"
 
 Analyze if this character is part of a multi-character word OR is a particle.
@@ -637,7 +780,7 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         padding: 12px;
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
         color: white;
-        z-index: 2147483651;
+        z-index: 9999999999;
         pointer-events: none;
         font-size: 14px;
         min-width: 120px;
@@ -647,7 +790,7 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
         <div style="font-size: 18px; margin-bottom: 4px;">${charDiv.dataset.char}</div>
         <div style="color: rgba(255, 255, 255, 0.6);">Processing...</div>
     `;
-    getPopupContainer().appendChild(hoverPopup);
+    document.body.appendChild(hoverPopup);  // Always append to body for highest z-index
 
     // Get word analysis from ChatGPT (with abort signal)
     const analysis = await getWordAnalysis(charDiv.dataset.char, fullText, charIndex, currentHoverAbortController.signal);
@@ -773,13 +916,13 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
             padding: 12px;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
             color: white;
-            z-index: 2147483651;
+            z-index: 9999999999;
             pointer-events: none;
             font-size: 14px;
             max-width: 300px;
             line-height: 1.4;
         `;
-        getPopupContainer().appendChild(hoverPopup);
+        document.body.appendChild(hoverPopup);  // Always append to body for highest z-index
     }
 
     // Update popup styling for results
@@ -851,6 +994,12 @@ function handleCharacterLeave() {
 // Create subtitle breakdown popup
 function createSubtitlePopup(text) {
     console.log(`🎨 Creating popup for subtitle: "${text}"`);
+    console.log(`🎨 Platform: ${platform.name}`);
+    console.log(`🎨 State before creation:`, {
+        isPopupOpen: state.isPopupOpen,
+        hasCurrentPopup: !!state.currentPopup,
+        isProcessing: state.isProcessingSubtitle
+    });
 
     // Always clean up any existing popup first
     if (state.currentPopup) {
@@ -880,11 +1029,22 @@ function createSubtitlePopup(text) {
 
     console.log(`✨ Creating fresh popup for subtitle: ${text}`);
 
-    // Get subtitle position - handle case where subtitle element might be null
+    // Get subtitle position - handle case where subtitle element might be null or temporary
     let subtitleRect = { top: window.innerHeight / 2, left: 0, width: 0 }; // default position
-    if (state.subtitleElement) {
+
+    if (state.subtitleElement && state.subtitleElement.getBoundingClientRect) {
         subtitleRect = state.subtitleElement.getBoundingClientRect();
         console.log('📍 Using subtitle element position:', subtitleRect);
+    } else if (platform.isNetflix) {
+        // For Netflix, try to find the actual subtitle element in DOM
+        const actualSubtitle = document.querySelector('.player-timedtext-text-container') ||
+                              document.querySelector('.player-timedtext');
+        if (actualSubtitle) {
+            subtitleRect = actualSubtitle.getBoundingClientRect();
+            console.log('📍 Using Netflix subtitle position:', subtitleRect);
+        } else {
+            console.log('📍 No Netflix subtitle element found, using default position');
+        }
     } else {
         console.log('📍 No subtitle element, using default position');
     }
@@ -892,93 +1052,130 @@ function createSubtitlePopup(text) {
     // Create popup positioned above subtitle
     const popup = document.createElement('div');
     popup.id = 'sublex-popup';
-    popup.style.cssText = `
-        position: fixed;
-        left: 50%;
-        bottom: ${window.innerHeight - subtitleRect.top + 100}px;
-        transform: translateX(-50%);
-        background: rgba(20, 20, 30, 0.95);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        border-radius: 12px;
-        padding: 20px;
-        padding-top: 15px;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.8);
-        min-width: 400px;
-        max-width: 90vw;
-        color: white;
-        z-index: 2147483650;
-        pointer-events: auto;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+    // Netflix may need higher z-index and different positioning
+    const zIndex = platform.isNetflix ? '2147483647' : '2147483650';
+
+    // For Netflix, use a simpler centered position
+    let popupStyles = '';
+    if (platform.isNetflix) {
+        popupStyles = `
+            position: fixed;
+            top: 82%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(20, 20, 30, 0.98);
+            border: 2px solid rgba(255, 255, 255, 0.4);
+            border-radius: 12px;
+            padding: 20px;
+            padding-top: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.9);
+            min-width: 400px;
+            max-width: 90vw;
+            color: white;
+            z-index: 2147483647;
+            pointer-events: auto;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+        `;
+    } else {
+        // Original positioning for Viki
+        popupStyles = `
+            position: fixed;
+            left: 50%;
+            bottom: ${window.innerHeight - subtitleRect.top + 100}px;
+            transform: translateX(-50%);
+            background: rgba(20, 20, 30, 0.95);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            padding-top: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+            min-width: 400px;
+            max-width: 90vw;
+            color: white;
+            z-index: ${zIndex};
+            pointer-events: auto;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: block !important;
+            visibility: visible !important;
+        `;
+    }
+
+    popup.style.cssText = popupStyles;
+    console.log('🎨 Popup styles set, z-index:', zIndex, 'Platform:', platform.name);
+
+
+    // API Key input section (hidden by default)
+    const keyInputSection = document.createElement('div');
+    keyInputSection.id = 'api-key-section';
+    keyInputSection.style.cssText = `
+        display: none;
+        margin-bottom: 15px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 8px;
     `;
 
+    const keyInputContainer = document.createElement('div');
+    keyInputContainer.style.cssText = `
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    `;
 
-    // Check for OpenAI API key and add input if missing
-    if (!state.openaiKey) {
-        const keyContainer = document.createElement('div');
-        keyContainer.style.cssText = `
-            margin-bottom: 15px;
-            padding: 12px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        `;
+    const openaiInput = document.createElement('input');
+    openaiInput.type = 'password';
+    openaiInput.placeholder = state.openaiKey ? 'Enter new API key' : 'Enter OpenAI API Key';
+    openaiInput.style.cssText = `
+        flex: 1;
+        padding: 8px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: white;
+        font-size: 14px;
+        outline: none;
+    `;
 
-        const openaiInput = document.createElement('input');
-        openaiInput.type = 'password';
-        openaiInput.placeholder = 'Enter OpenAI API Key';
-        openaiInput.style.cssText = `
-            flex: 1;
-            padding: 8px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 4px;
-            color: white;
-            font-size: 14px;
-            outline: none;
-        `;
-        openaiInput.addEventListener('focus', () => {
-            openaiInput.style.borderColor = 'rgba(255, 255, 255, 0.5)';
-        });
-        openaiInput.addEventListener('blur', () => {
-            openaiInput.style.borderColor = 'rgba(255, 255, 255, 0.2)';
-        });
+    const openaiSaveBtn = document.createElement('button');
+    openaiSaveBtn.textContent = 'Save';
+    openaiSaveBtn.style.cssText = `
+        padding: 8px 15px;
+        background: #4CAF50;
+        border: none;
+        border-radius: 4px;
+        color: white;
+        font-size: 14px;
+        cursor: pointer;
+    `;
 
-        const openaiSaveBtn = document.createElement('button');
-        openaiSaveBtn.textContent = 'Save';
-        openaiSaveBtn.style.cssText = `
-            padding: 8px 15px;
-            background: #4CAF50;
-            border: none;
-            border-radius: 4px;
-            color: white;
-            font-size: 14px;
-            cursor: pointer;
-            transition: background 0.2s;
-        `;
-        openaiSaveBtn.onmouseover = () => openaiSaveBtn.style.background = '#45a049';
-        openaiSaveBtn.onmouseout = () => openaiSaveBtn.style.background = '#4CAF50';
+    openaiSaveBtn.onclick = async () => {
+        const key = openaiInput.value.trim();
+        if (key) {
+            await browser.storage.local.set({ openaiKey: key });
+            state.openaiKey = key;
+            openaiInput.value = '';
+            keyInputSection.style.display = 'none';
+            console.log('OpenAI key updated');
 
-        openaiSaveBtn.onclick = async () => {
-            const key = openaiInput.value.trim();
-            if (key) {
-                await browser.storage.local.set({ openaiKey: key });
-                state.openaiKey = key;
-                keyContainer.remove();
-                console.log('OpenAI key saved');
+            // Clear caches and reprocess
+            state.responseCache = {};
+            state.chatgptBreakdown = null;
+            state.lastProcessedText = '';
 
-                // If we have subtitle text, process it with ChatGPT
-                if (state.currentSubtitleText) {
-                    processSubtitleWithChatGPT(state.currentSubtitleText);
-                }
+            if (state.currentSubtitleText) {
+                processSubtitleWithChatGPT(state.currentSubtitleText);
             }
-        };
+        }
+    };
 
-        keyContainer.appendChild(openaiInput);
-        keyContainer.appendChild(openaiSaveBtn);
-        popup.appendChild(keyContainer);
-    }
+    keyInputContainer.appendChild(openaiInput);
+    keyInputContainer.appendChild(openaiSaveBtn);
+    keyInputSection.appendChild(keyInputContainer);
+    popup.appendChild(keyInputSection);
 
     // Use subtitle text (keep punctuation)
     const cleanedText = text.trim();
@@ -1201,6 +1398,7 @@ function createSubtitlePopup(text) {
 
     // Q&A input field
     const qaInput = document.createElement('input');
+    qaInput.id = 'qa-input'; // Add stable ID for finding it during updates
     qaInput.type = 'text';
     qaInput.placeholder = '';
     qaInput.style.cssText = `
@@ -1212,6 +1410,62 @@ function createSubtitlePopup(text) {
         color: white;
         font-size: 13px;
     `;
+
+    // Maintain focus when user is typing
+    let userIsTyping = false;
+    let lastTypingTime = 0;
+
+    qaInput.addEventListener('focus', () => {
+        userIsTyping = true;
+        lastTypingTime = Date.now();
+
+        // Start focus maintenance interval
+        if (state.qaInputFocusInterval) {
+            clearInterval(state.qaInputFocusInterval);
+        }
+
+        state.qaInputFocusInterval = setInterval(() => {
+            // Keep focus if user typed recently (within last 10 seconds)
+            if (userIsTyping && Date.now() - lastTypingTime < 10000) {
+                if (document.activeElement !== qaInput && document.getElementById('qa-input')) {
+                    const currentValue = qaInput.value;
+                    const currentPos = qaInput.selectionStart;
+                    qaInput.focus();
+                    qaInput.value = currentValue;
+                    qaInput.setSelectionRange(currentPos, currentPos);
+                    console.log('🔄 Restored Q&A input focus');
+                }
+            } else if (Date.now() - lastTypingTime > 10000) {
+                // Stop maintaining focus after 10 seconds of inactivity
+                userIsTyping = false;
+                clearInterval(state.qaInputFocusInterval);
+                state.qaInputFocusInterval = null;
+            }
+        }, 100);
+    });
+
+    qaInput.addEventListener('blur', () => {
+        // Only truly blur if user hasn't typed recently
+        setTimeout(() => {
+            if (Date.now() - lastTypingTime > 500) {
+                userIsTyping = false;
+                if (state.qaInputFocusInterval) {
+                    clearInterval(state.qaInputFocusInterval);
+                    state.qaInputFocusInterval = null;
+                }
+            }
+        }, 100);
+    });
+
+    qaInput.addEventListener('input', () => {
+        userIsTyping = true;
+        lastTypingTime = Date.now();
+    });
+
+    qaInput.addEventListener('keydown', () => {
+        userIsTyping = true;
+        lastTypingTime = Date.now();
+    });
 
     // Send button
     const qaSendBtn = document.createElement('button');
@@ -1313,6 +1567,45 @@ function createSubtitlePopup(text) {
         }
     };
 
+    // Create API key button (settings icon)
+    const keyButton = document.createElement('button');
+    keyButton.innerHTML = '<span style="font-size: 16px;">⚙</span>';  // Settings/gear icon (larger)
+    keyButton.title = state.openaiKey ? 'Update API Key' : 'Set API Key';
+    keyButton.style.cssText = `
+        padding: 8px 15px;
+        background: rgba(255, 255, 255, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+        color: rgba(255, 255, 255, 0.9);
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+
+    keyButton.onmouseover = () => {
+        keyButton.style.background = 'rgba(255, 255, 255, 0.2)';
+        keyButton.style.borderColor = 'rgba(255, 255, 255, 0.3)';
+    };
+    keyButton.onmouseout = () => {
+        keyButton.style.background = 'rgba(255, 255, 255, 0.15)';
+        keyButton.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+    };
+
+    keyButton.onclick = () => {
+        // Toggle the API key input section
+        const apiKeySection = document.getElementById('api-key-section');
+        if (apiKeySection) {
+            if (apiKeySection.style.display === 'none') {
+                apiKeySection.style.display = 'block';
+                // Focus the input field
+                const input = apiKeySection.querySelector('input');
+                if (input) input.focus();
+            } else {
+                apiKeySection.style.display = 'none';
+            }
+        }
+    };
+
     qaSendBtn.onclick = submitQuestion;
     qaInput.onkeypress = (e) => {
         if (e.key === 'Enter') submitQuestion();
@@ -1322,6 +1615,7 @@ function createSubtitlePopup(text) {
     qaInputContainer.appendChild(qaInput);
     qaInputContainer.appendChild(qaSendBtn);
     qaInputContainer.appendChild(replayButton);
+    qaInputContainer.appendChild(keyButton);
     qaSection.appendChild(qaInputContainer);
 
     contentContainer.appendChild(qaSection);
@@ -1332,6 +1626,12 @@ function createSubtitlePopup(text) {
     // Close handlers - ESC key and video resume
     const closePopup = () => {
         console.log('🧹 Closing popup and resetting state');
+
+        // Clear focus maintenance interval
+        if (state.qaInputFocusInterval) {
+            clearInterval(state.qaInputFocusInterval);
+            state.qaInputFocusInterval = null;
+        }
 
         // Clear conversation history when closing
         state.conversationHistory = [];
@@ -1356,6 +1656,7 @@ function createSubtitlePopup(text) {
         // Reset processing state
         state.chatgptBreakdown = null;
         state.lastProcessedText = '';
+        state.isProcessingSubtitle = false;
 
         resumeVideo();
         console.log('✅ All popups closed, state reset');
@@ -1375,17 +1676,143 @@ function createSubtitlePopup(text) {
         e.stopPropagation();
     });
 
+    // Prevent popup from losing focus due to DOM mutations (video controls, etc)
+    const observer = new MutationObserver(() => {
+        // Check if Q&A input should have focus
+        const qaInputElement = document.getElementById('qa-input');
+        if (qaInputElement && userIsTyping && Date.now() - lastTypingTime < 10000) {
+            if (document.activeElement !== qaInputElement) {
+                const currentValue = qaInputElement.value;
+                const currentPos = qaInputElement.selectionStart || currentValue.length;
+                qaInputElement.focus();
+                qaInputElement.value = currentValue;
+                qaInputElement.setSelectionRange(currentPos, currentPos);
+                console.log('🔄 Restored focus after DOM mutation');
+            }
+        }
+    });
+
+    // Observe body for any DOM changes that might steal focus
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['style', 'class'] // Video controls often change these
+    });
+
     // Append popup to correct container (handles fullscreen)
-    const container = getPopupContainer();
-    container.appendChild(popup);
-    console.log('Popup appended to:', container === document.body ? 'body' : 'fullscreen element');
+    let container = getPopupContainer();
+    console.log('🎨 Attempting to append popup to container:', container?.tagName, container?.className);
+
+    // For Netflix, if we're not getting a good container, just use body
+    if (platform.isNetflix && container !== document.body) {
+        console.log('🔄 Netflix: Switching to document.body for popup container');
+        container = document.body;
+    }
+
+    try {
+        container.appendChild(popup);
+        console.log('✅ Popup successfully appended to:', container === document.body ? 'body' : 'fullscreen element');
+        console.log('✅ Popup element exists in DOM:', !!document.getElementById('sublex-popup'));
+
+        // Verify the popup is actually visible
+        const addedPopup = document.getElementById('sublex-popup');
+        if (addedPopup) {
+            const rect = addedPopup.getBoundingClientRect();
+            console.log('📍 Popup position after append:', {
+                top: rect.top,
+                bottom: rect.bottom,
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+                height: rect.height,
+                onScreen: rect.bottom > 0 && rect.top < window.innerHeight
+            });
+        }
+    } catch (error) {
+        console.error('❌ Failed to append popup:', error);
+        console.error('Container:', container);
+        console.error('Popup:', popup);
+    }
 
     state.currentPopup = popup;
+
+    // Debug: Check actual computed styles and position
+    setTimeout(() => {
+        const checkPopup = document.getElementById('sublex-popup');
+        if (checkPopup) {
+            const rect = checkPopup.getBoundingClientRect();
+            const styles = window.getComputedStyle(checkPopup);
+            console.log('🔍 POPUP DEBUG - Position check:', {
+                exists: true,
+                rect: {
+                    top: rect.top,
+                    left: rect.left,
+                    width: rect.width,
+                    height: rect.height,
+                    visible: rect.width > 0 && rect.height > 0
+                },
+                styles: {
+                    display: styles.display,
+                    visibility: styles.visibility,
+                    opacity: styles.opacity,
+                    zIndex: styles.zIndex,
+                    position: styles.position
+                },
+                parent: checkPopup.parentElement?.className || 'unknown'
+            });
+        } else {
+            console.log('🔍 POPUP DEBUG - Popup not found in DOM!');
+        }
+    }, 100);
+
+    console.log('🎨 State after popup creation:', {
+        isPopupOpen: state.isPopupOpen,
+        hasCurrentPopup: !!state.currentPopup,
+        popupInDOM: !!document.getElementById('sublex-popup')
+    });
 }
 
 // Check for Chinese subtitles and update current text
 function checkForChineseSubtitles() {
-    const subtitleElement = document.querySelector('.vjs-text-track-cue');
+    let subtitleElement = null;
+
+    if (platform.isViki) {
+        subtitleElement = document.querySelector('.vjs-text-track-cue');
+    } else if (platform.isNetflix) {
+        // Netflix uses different selectors for subtitles - try multiple approaches
+        // First try to get the actual subtitle container
+        let actualSubtitleElement = document.querySelector('.player-timedtext-text-container') ||
+                                    document.querySelector('.player-timedtext') ||
+                                    document.querySelector('[data-uia="subtitle-text-container"]') ||
+                                    document.querySelector('.player-timedtext-container');
+
+        if (actualSubtitleElement) {
+            // Use the actual element if found
+            subtitleElement = actualSubtitleElement;
+        } else {
+            // Fallback: get all subtitle spans and combine their text
+            const subtitleSpans = document.querySelectorAll('.player-timedtext-text-container span');
+            if (subtitleSpans.length > 0) {
+                // Use the parent container if available, otherwise create temporary element
+                const parent = subtitleSpans[0].closest('.player-timedtext-text-container');
+                if (parent) {
+                    subtitleElement = parent;
+                } else {
+                    // Create a temporary element to hold combined text
+                    const tempElement = document.createElement('div');
+                    tempElement.textContent = Array.from(subtitleSpans).map(span => span.textContent).join('');
+                    subtitleElement = tempElement;
+                }
+            }
+        }
+
+        // Debug logging for Netflix (only log once per text change)
+        if (subtitleElement?.textContent !== state.lastLoggedNetflixText) {
+            state.lastLoggedNetflixText = subtitleElement?.textContent;
+            console.log('🎬 Netflix subtitle found:', subtitleElement?.textContent?.substring(0, 100));
+        }
+    }
     const video = document.querySelector('video');
 
     if (!subtitleElement) {
@@ -1421,10 +1848,24 @@ function checkForChineseSubtitles() {
             state.currentSubtitleText = text;
             state.subtitleElement = subtitleElement;
             state.currentSubtitleStartTime = video ? video.currentTime : null;
+
+            // Store as last known Chinese subtitle (for Netflix pause issue)
+            state.lastKnownChineseSubtitle = text;
+            state.lastKnownSubtitleTime = Date.now();
+
             console.log('📝 SUBTITLE: Chinese subtitle detected:', text);
         }
     } else {
         if (state.currentSubtitleText !== null) {
+            // On Netflix, don't immediately clear if we just paused
+            if (platform.isNetflix && video && video.paused && state.lastKnownChineseSubtitle) {
+                const timeSinceLastSubtitle = Date.now() - (state.lastKnownSubtitleTime || 0);
+                if (timeSinceLastSubtitle < 1000) { // Within 1 second
+                    console.log('📝 SUBTITLE: Netflix pause detected, keeping last known subtitle:', state.lastKnownChineseSubtitle);
+                    return; // Don't clear the subtitle
+                }
+            }
+
             state.currentSubtitleText = null;
             state.subtitleElement = null;
             console.log('📝 SUBTITLE: Non-Chinese subtitle, cleared current text');
@@ -1443,11 +1884,65 @@ function setupVideoMonitoring() {
             return;
         }
 
-        console.log('Video element found, setting up pause/play monitoring');
+        console.log('Video element found on', platform.name, ', setting up pause/play monitoring');
+        console.log('Video element:', video);
+        console.log('Video paused state:', video.paused);
 
-        // Track play state before popup
-        video.addEventListener('play', () => {
-            console.log('Video playing');
+        // Netflix-specific: poll for pause state changes as events might not fire reliably
+        if (platform.isNetflix) {
+            let lastPausedState = video.paused;
+            let pollCount = 0;
+            console.log('🎬 Starting Netflix pause polling, initial state:', lastPausedState);
+
+            const pollInterval = setInterval(() => {
+                pollCount++;
+                const currentPausedState = video.paused;
+
+                // Log every 50 polls (5 seconds) to confirm polling is running
+                if (pollCount % 50 === 0) {
+                    console.log('🔍 Netflix polling active, check #' + pollCount + ', paused:', currentPausedState);
+                }
+
+                if (currentPausedState !== lastPausedState) {
+                    console.log('🎬 Netflix video state changed:', lastPausedState, '->', currentPausedState);
+
+                    if (currentPausedState) {
+                        // Video was just paused
+                        console.log('🎬 Netflix video PAUSED (detected via polling)');
+                        console.log('🎬 Video element still exists:', !!video);
+                        console.log('🎬 Video paused property:', video.paused);
+                        handleVideoPause();
+                    } else {
+                        // Video was just resumed
+                        console.log('🎬 Netflix video RESUMED (detected via polling)');
+                        handleVideoPlay();
+                    }
+
+                    lastPausedState = currentPausedState;
+                }
+
+                // Check if video element is still valid
+                if (!document.contains(video)) {
+                    console.log('⚠️ Video element removed from DOM, stopping polling');
+                    clearInterval(pollInterval);
+
+                    // Try to find a new video element
+                    setTimeout(() => {
+                        console.log('🔄 Looking for new video element...');
+                        findAndMonitorVideo();
+                    }, 1000);
+                }
+            }, 100); // Check every 100ms
+        }
+
+        // Define handler functions that can be called from both events and polling
+        const handleVideoPlay = () => {
+            console.log('🎬 Handling video play/resume');
+            console.log('🎬 State before reset:', {
+                isPopupOpen: state.isPopupOpen,
+                isProcessing: state.isProcessingSubtitle,
+                hasPopup: !!state.currentPopup
+            });
 
             // Close popup and reset all state when video starts playing
             if (state.isPopupOpen && state.currentPopup) {
@@ -1461,55 +1956,132 @@ function setupVideoMonitoring() {
             state.chatgptBreakdown = null;
             state.lastProcessedText = '';
             state.wasPlayingBeforePopup = true;
+            state.isProcessingSubtitle = false;  // Critical: reset this flag
 
             console.log('🎬 Video resumed - all state reset for next pause');
-        });
+            console.log('🎬 State after reset:', {
+                isPopupOpen: state.isPopupOpen,
+                isProcessing: state.isProcessingSubtitle,
+                hasPopup: !!state.currentPopup
+            });
+        };
 
-        video.addEventListener('pause', () => {
-            console.log('Video paused');
+        const handleVideoPause = () => {
+            console.log('🎬 Handling video pause');
+            console.log('🎬 Current subtitle text:', state.currentSubtitleText);
+            console.log('🎬 Last known Chinese subtitle:', state.lastKnownChineseSubtitle);
+            console.log('🎬 State check - Popup open:', state.isPopupOpen, 'Processing:', state.isProcessingSubtitle);
 
             // Don't open popup if we already have one
-            if (state.isPopupOpen) return;
+            if (state.isPopupOpen) {
+                console.log('⚠️ Skipping - popup already open');
+                return;
+            }
 
-            // Small delay to ensure subtitle is rendered, then check multiple times
+            // For Netflix, always reset processing flag on new pause to avoid getting stuck
+            if (platform.isNetflix && state.isProcessingSubtitle) {
+                console.log('🔧 Netflix: Resetting stuck processing flag');
+                state.isProcessingSubtitle = false;
+            }
+
+            // For Netflix, if no current subtitle but we have a recent one, use it
+            if (platform.isNetflix && !state.currentSubtitleText && state.lastKnownChineseSubtitle) {
+                const timeSinceLastSubtitle = Date.now() - (state.lastKnownSubtitleTime || 0);
+                if (timeSinceLastSubtitle < 2000) { // Within 2 seconds
+                    console.log('🔧 Netflix: Using last known subtitle from', timeSinceLastSubtitle, 'ms ago');
+                    state.currentSubtitleText = state.lastKnownChineseSubtitle;
+                }
+            }
+
+            // Netflix may need longer delay for subtitle rendering
+            const initialDelay = platform.isNetflix ? 300 : 100;
+            const retryDelay = platform.isNetflix ? 400 : 200;
+
             setTimeout(() => {
+                console.log('🎬 First check for subtitles...');
                 // Check for current Chinese subtitle multiple times to ensure we catch it
                 checkForChineseSubtitles();
+                console.log('🎬 After first check, subtitle text:', state.currentSubtitleText);
 
                 // If no subtitle found, try again after a short delay
                 if (!state.currentSubtitleText) {
                     setTimeout(() => {
+                        console.log('🎬 Second check for subtitles...');
                         checkForChineseSubtitles();
                         console.log('📝 SUBTITLE: Second check result:', state.currentSubtitleText);
-                        processWithCurrentSubtitle();
-                    }, 200);
+
+                        // Netflix might need a third attempt
+                        if (!state.currentSubtitleText && platform.isNetflix) {
+                            setTimeout(() => {
+                                console.log('🎬 Third check for subtitles (Netflix)...');
+                                checkForChineseSubtitles();
+                                console.log('📝 SUBTITLE: Third check result (Netflix):', state.currentSubtitleText);
+                                processWithCurrentSubtitle();
+                            }, 300);
+                        } else {
+                            processWithCurrentSubtitle();
+                        }
+                    }, retryDelay);
                 } else {
+                    console.log('🎬 Subtitle found on first check, processing...');
                     processWithCurrentSubtitle();
                 }
-            }, 100);
-        });
+            }, initialDelay);
+        };
+
+        // Track play state before popup - use capture phase for Netflix
+        const useCapture = platform.isNetflix;
+
+        // Also add traditional event listeners as fallback
+        video.addEventListener('play', () => {
+            console.log('🎬 VIDEO PLAY EVENT (traditional)');
+            if (!platform.isNetflix) { // Only use for non-Netflix to avoid duplicate handling
+                handleVideoPlay();
+            }
+        }, useCapture);
+
+        video.addEventListener('pause', () => {
+            console.log('🎬 VIDEO PAUSE EVENT (traditional)');
+            if (!platform.isNetflix) { // Only use for non-Netflix to avoid duplicate handling
+                handleVideoPause();
+            }
+        }, useCapture);
 
         function processWithCurrentSubtitle() {
+            // Prevent multiple simultaneous processing
+            if (state.isProcessingSubtitle || state.isPopupOpen) {
+                console.log('Already processing or popup open, skipping');
+                return;
+            }
+
             console.log('🎬 PAUSE HANDLER: Processing with subtitle:', state.currentSubtitleText);
-            console.log('🎬 PAUSE HANDLER: Subtitle element exists:', !!state.subtitleElement);
             console.log('🎬 PAUSE HANDLER: OpenAI key available:', !!state.openaiKey);
-            console.log('🎬 PAUSE HANDLER: Popup already open:', state.isPopupOpen);
 
             // Only show popup if we have Chinese subtitle text or no OpenAI key (for key input)
             if (state.currentSubtitleText) {
+                state.isProcessingSubtitle = true;
+                console.log('🔄 Set isProcessingSubtitle = true');
+
                 // Process with ChatGPT if key is available
                 if (state.openaiKey) {
                     console.log('🎬 Using ChatGPT for analysis');
-                    processSubtitleWithChatGPT(state.currentSubtitleText);
+                    processSubtitleWithChatGPT(state.currentSubtitleText).finally(() => {
+                        console.log('🔄 ChatGPT processing complete, setting isProcessingSubtitle = false');
+                        state.isProcessingSubtitle = false;
+                    });
                 } else {
                     console.log('🎬 No OpenAI key, opening popup for API key input');
                     createSubtitlePopup(state.currentSubtitleText);
+                    console.log('🔄 Popup created, setting isProcessingSubtitle = false');
+                    state.isProcessingSubtitle = false;
                 }
             } else if (!state.openaiKey) {
                 console.log('🎬 No subtitle text but no OpenAI key - showing popup for key input');
                 createSubtitlePopup('');
+                state.isProcessingSubtitle = false;
             } else {
                 console.log('🎬 No Chinese subtitle text - not showing popup');
+                state.isProcessingSubtitle = false;
             }
         }
 
@@ -1532,29 +2104,54 @@ function setupVideoMonitoring() {
 
 // Monitor subtitle changes
 function setupSubtitleMonitoring() {
-    console.log("Starting subtitle monitoring...");
+    console.log("Starting subtitle monitoring on", platform.name);
 
     // Use MutationObserver to watch for subtitle changes
-    const observer = new MutationObserver(() => {
+    const observer = new MutationObserver((mutations) => {
+        // Only check for subtitles, don't spam logs
         checkForChineseSubtitles();
-        // Don't create popup here - let the pause handler deal with it
-        // This observer just tracks subtitle changes
     });
 
     // Wait for video player to load
     function startObserving() {
-        const videoContainer = document.querySelector('.video-js, #video-player, .vjs-text-track-display');
+        let videoContainer = null;
+
+        if (platform.isViki) {
+            videoContainer = document.querySelector('.video-js, #video-player, .vjs-text-track-display');
+        } else if (platform.isNetflix) {
+            // Netflix needs broader observation scope
+            videoContainer = document.querySelector('.watch-video') ||
+                           document.querySelector('.player-timedtext') ||
+                           document.querySelector('.PlayerContainer') ||
+                           document.querySelector('.VideoContainer') ||
+                           document.querySelector('[data-uia="video-canvas"]') ||
+                           document.body; // Fallback to body for Netflix
+        } else {
+            videoContainer = document.querySelector('video')?.parentElement;
+        }
         if (videoContainer) {
             observer.observe(videoContainer, {
                 childList: true,
                 subtree: true,
-                characterData: true
+                characterData: true,
+                attributes: true // Add attribute observation for Netflix
             });
-            console.log("Started observing subtitle changes");
+            console.log("Started observing subtitle changes on", platform.name);
+            console.log("Observing container:", videoContainer.className || videoContainer.tagName);
 
             // Also run periodically to catch any missed updates
-            setInterval(checkForChineseSubtitles, 500);
+            // But throttle to prevent spam
+            let lastCheck = 0;
+            const checkInterval = platform.isNetflix ? 500 : 500;
+            setInterval(() => {
+                const now = Date.now();
+                if (now - lastCheck > checkInterval - 100) {
+                    lastCheck = now;
+                    checkForChineseSubtitles();
+                }
+            }, checkInterval);
         } else {
+            console.log("Container not found, retrying...");
             setTimeout(startObserving, 1000);
         }
     }
@@ -1578,7 +2175,24 @@ async function loadStoredKeys() {
 // Initialize extension
 console.log("Initializing SubLex extension...");
 console.log("Current URL:", window.location.href);
-console.log("Is Viki domain:", window.location.hostname.includes('viki.com'));
+console.log("Platform:", platform.name);
+console.log("Is Viki:", platform.isViki, "Is Netflix:", platform.isNetflix);
+
+// Netflix-specific initialization
+if (platform.isNetflix) {
+    console.log("🎬 Netflix detected - setting up Netflix-specific handlers");
+
+    // Netflix may need time to load its player
+    setTimeout(() => {
+        console.log("🎬 Delayed Netflix initialization");
+        // Log available subtitle containers
+        const timedtextElements = document.querySelectorAll('[class*="timedtext"]');
+        console.log("🎬 Found", timedtextElements.length, "timedtext elements");
+        timedtextElements.forEach(el => {
+            console.log("  -", el.className, ":", el.textContent?.substring(0, 50));
+        });
+    }, 3000);
+}
 
 try {
     loadStoredKeys();

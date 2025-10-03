@@ -21,7 +21,12 @@
 
     "content_scripts": [{
         "js": [ "content.js" ],
-        "matches": [ "*://*.viki.com/*", "*://viki.com/*" ]
+        "matches": [
+            "*://*.viki.com/*",
+            "*://viki.com/*",
+            "*://*.netflix.com/*",
+            "*://netflix.com/*"
+        ]
     }],
 
     "action": {
