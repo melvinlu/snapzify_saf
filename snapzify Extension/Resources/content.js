@@ -681,7 +681,12 @@ async function getQAResponse(question, chineseText) {
 async function getWordAnalysis(character, fullText, charIndex, abortSignal, retryCount = 0) {
     const MAX_RETRIES = 1; // Fewer retries for hover to keep it snappy
 
-    console.log('🔍 getWordAnalysis called:', { character, fullText, charIndex });
+    console.log('🔍 getWordAnalysis called:', {
+        character,
+        charIndex,
+        fullTextLength: fullText?.length,
+        fullTextPreview: fullText ? fullText.substring(0, 50) + '...' : null
+    });
 
     try {
         // Check if API key exists
@@ -695,36 +700,52 @@ async function getWordAnalysis(character, fullText, charIndex, abortSignal, retr
 
         // Extract surrounding context for better word detection
         const chineseChars = fullText ? fullText.match(/[\u4e00-\u9fff]/g) || [] : [];
-        const contextStart = Math.max(0, charIndex - 3);
-        const contextEnd = Math.min(chineseChars.length, charIndex + 4);
+
+        // Get more context around the character
+        const contextStart = Math.max(0, charIndex - 5);
+        const contextEnd = Math.min(chineseChars.length, charIndex + 6);
         const contextChars = chineseChars.slice(contextStart, contextEnd).join('');
         const positionInContext = charIndex - contextStart;
+
+        // Get immediate neighbors for better detection
+        const prevChar = charIndex > 0 ? chineseChars[charIndex - 1] : '';
+        const nextChar = charIndex < chineseChars.length - 1 ? chineseChars[charIndex + 1] : '';
+        const prev2Chars = charIndex > 1 ? chineseChars[charIndex - 2] + chineseChars[charIndex - 1] : '';
+        const next2Chars = charIndex < chineseChars.length - 2 ? chineseChars[charIndex + 1] + chineseChars[charIndex + 2] : '';
 
         const requestBody = {
             model: 'gpt-3.5-turbo',
             messages: [{
                 role: 'user',
-                content: `Context: From video "${videoTitle}"
+                content: `Analyze this Chinese text for word boundaries:
 Full text: "${fullText}"
-Looking at these Chinese characters: "${contextChars}"
-The character "${character}" is at position ${positionInContext} in this substring (0-indexed).
+Focus character: "${character}" at position ${charIndex}
+Context window: "${contextChars}"
+Position in context: ${positionInContext}
 
-CRITICAL: Find the word that contains "${character}" at this EXACT position in "${contextChars}".
+Immediate context:
+- Previous character: "${prevChar}"
+- Current character: "${character}"
+- Next character: "${nextChar}"
+- Previous 2 chars: "${prev2Chars}"
+- Next 2 chars: "${next2Chars}"
 
-Common words to check for:
-- 已经 (yǐjīng - already)
-- 半年 (bànnián - half year)
-- 年多 (niánduō - more than a year)
-- 结成 (jiéchéng - to form)
-- 侠侣 (xiálǚ - heroic couple)
+RULES:
+1. Check if "${character}" forms a word with adjacent characters
+2. Common two-character words to check:
+   - ${prevChar}${character} (if this is a known word)
+   - ${character}${nextChar} (if this is a known word)
+3. Common patterns:
+   - 已经 (already), 但是 (but), 因为 (because), 所以 (so)
+   - 什么 (what), 怎么 (how), 为什么 (why)
+   - Time words: 今天 (today), 明天 (tomorrow), 昨天 (yesterday)
+   - 半年 (half year), 一年 (one year), 多年 (many years)
 
-ANALYZE "${contextChars}" character by character:
-${contextChars.split('').map((c, i) => `Position ${i}: ${c}`).join('\n')}
+Examine the context and determine:
+Is "${character}" part of a multi-character word? If yes, what is the complete word?
 
-The character "${character}" at position ${positionInContext} is part of which word?
-
-For multi-character compound words, return:
-{"isWord":true,"word":"[complete compound word]","wordDef":"[translation]","chars":[{"char":"[each char]","pinyin":"[pinyin]","def":"[individual meaning]"}...]}
+For multi-character words, return:
+{"isWord":true,"word":"[complete word]","wordDef":"[translation]","chars":[{"char":"[char]","pinyin":"[pinyin]","def":"[meaning]"}...]}
 
 For single characters, return:
 {"isWord":false,"chars":[{"char":"${character}","pinyin":"[pinyin]","def":"[meaning]"}]}
@@ -876,22 +897,36 @@ async function handleCharacterHover(event, charDiv, characterDataArray) {
 
         // Look for the word starting at or before the current character
         console.log(`🔍 HOVER DEBUG - Searching for word "${analysis.word}" containing char at index ${chineseCharIndex}`);
-        for (let startPos = Math.max(0, chineseCharIndex - analysis.word.length + 1); startPos <= chineseCharIndex; startPos++) {
-            let matches = true;
-            console.log(`🔍 HOVER DEBUG - Checking start position ${startPos}`);
-            for (let i = 0; i < analysis.word.length && startPos + i < chineseCharDivs.length; i++) {
-                const divChar = chineseCharDivs[startPos + i].dataset.char;
-                const wordChar = analysis.word[i];
-                console.log(`🔍   Comparing pos ${startPos + i}: div="${divChar}" vs word[${i}]="${wordChar}"`);
-                if (divChar !== wordChar) {
-                    matches = false;
+
+        // First, verify that the word actually contains our character
+        const hoveredChar = charDiv.dataset.char;
+        if (!analysis.word.includes(hoveredChar)) {
+            console.log(`⚠️ WARNING: Returned word "${analysis.word}" doesn't contain character "${hoveredChar}"`);
+            // Fall back to single character
+            wordChars.push({
+                char: hoveredChar,
+                pinyin: charDiv.dataset.pinyin || '',
+                individualDefinition: analysis.chars?.[0]?.def || ''
+            });
+        } else {
+            // Search for the word in the text
+            for (let startPos = Math.max(0, chineseCharIndex - analysis.word.length + 1); startPos <= chineseCharIndex; startPos++) {
+                let matches = true;
+                console.log(`🔍 HOVER DEBUG - Checking start position ${startPos}`);
+                for (let i = 0; i < analysis.word.length && startPos + i < chineseCharDivs.length; i++) {
+                    const divChar = chineseCharDivs[startPos + i].dataset.char;
+                    const wordChar = analysis.word[i];
+                    console.log(`🔍   Comparing pos ${startPos + i}: div="${divChar}" vs word[${i}]="${wordChar}"`);
+                    if (divChar !== wordChar) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches && startPos <= chineseCharIndex && startPos + analysis.word.length > chineseCharIndex) {
+                    wordStartIndex = startPos;
+                    console.log('🔍 HOVER DEBUG - Found word at position:', wordStartIndex);
                     break;
                 }
-            }
-            if (matches && startPos <= chineseCharIndex && startPos + analysis.word.length > chineseCharIndex) {
-                wordStartIndex = startPos;
-                console.log('🔍 HOVER DEBUG - Found word at position:', wordStartIndex);
-                break;
             }
         }
 
@@ -1118,19 +1153,20 @@ function createSubtitlePopup(text) {
     // Use saved settings if available, otherwise use defaults
     let popupStyles = '';
     if (state.savedPopupSettings) {
-        // Use saved settings
+        // Use saved settings - apply exact position and dimensions
         popupStyles = `
             position: fixed;
             top: ${state.savedPopupSettings.top}px;
             left: ${state.savedPopupSettings.left}px;
-            width: ${state.savedPopupSettings.width ? state.savedPopupSettings.width + 'px' : 'auto'};
+            width: ${state.savedPopupSettings.width}px;
+            height: ${state.savedPopupSettings.height}px;
+            box-sizing: border-box;
             background: rgb(20, 20, 30);
             border: 2px solid rgba(255, 255, 255, 0.4);
             border-radius: 12px;
             padding: 10px;
             padding-top: 15px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.9);
-            width: fit-content;
             min-width: 200px;
             max-width: 600px;
             resize: both;
@@ -1150,6 +1186,7 @@ function createSubtitlePopup(text) {
             top: 82%;
             left: 50%;
             transform: translate(-50%, -50%);
+            box-sizing: border-box;
             background: rgb(20, 20, 30);
             border: 2px solid rgba(255, 255, 255, 0.4);
             border-radius: 12px;
@@ -2453,14 +2490,23 @@ function checkForChineseSubtitles() {
                     state.meaningPermanentlyVisible = false;
                     state.qaExpanded = false;
                 } else {
-                    // Normal: auto-pause and keep popup open for review
-                    const video = document.querySelector('video');
-                    if (video && !video.paused) {
-                        video.pause();
-                        console.log('⏸️ Auto-paused video for subtitle review');
+                    // Normal: just close the popup, don't pause
+                    console.log('🎯 Chinese text gone - closing popup');
+
+                    // Close Q&A panel if open
+                    const qaPanel = document.getElementById('qa-side-panel');
+                    if (qaPanel) {
+                        qaPanel.remove();
                     }
-                    // Keep popup open for review (don't close it)
-                    console.log('🎯 Chinese text gone - keeping popup open for review');
+
+                    state.currentPopup.remove();
+                    state.currentPopup = null;
+                    state.isPopupOpen = false;
+                    state.chatgptBreakdown = null;
+                    state.lastProcessedText = '';
+                    state.pinyinPermanentlyVisible = false;
+                    state.meaningPermanentlyVisible = false;
+                    state.qaExpanded = false;
                 }
             }
         }
